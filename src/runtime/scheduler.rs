@@ -3,6 +3,7 @@
 use super::{
     actor::{Erased, ErasedKind, Executed, Mode},
     metrics::ShardMetrics,
+    timing::{SharedTimingObserver, TimingStage},
 };
 use crate::{
     ActorError,
@@ -33,6 +34,7 @@ pub(super) struct CommandRequest {
     /// None for session actors; mandatory for durable actors.
     pub(super) request_id: Option<String>,
     pub(super) hash: Option<[u8; 32]>,
+    pub(super) queued_at: Option<Instant>,
     pub(super) reply: oneshot::Sender<Result<Erased, ActorError>>,
 }
 pub(super) enum Request {
@@ -97,6 +99,7 @@ pub(super) enum Completion {
         next: Erased,
         reply: Erased,
         new_version: u64,
+        storage_finished_at: Option<Instant>,
         result: Result<CommitResult, ActorError>,
     },
 }
@@ -107,6 +110,7 @@ pub(super) struct Shard {
     pub(super) kinds: Arc<HashMap<&'static str, Arc<dyn ErasedKind>>>,
     pub(super) storage: Option<StorageBackend>,
     pub(super) ownership: Option<Ownership>,
+    pub(super) timing_observer: Option<SharedTimingObserver>,
     pub(super) slots: HashMap<ActorId, Slot>,
     pub(super) ready: VecDeque<ActorId>,
     pub(super) pending: FuturesUnordered<BoxFuture<'static, Completion>>,
@@ -153,7 +157,7 @@ impl Shard {
     }
 
     fn accept(&mut self, env: Envelope) {
-        let Envelope { id, request } = env;
+        let Envelope { id, mut request } = env;
         let Some(kind) = self.kinds.get(id.kind).cloned() else {
             self.metrics
                 .rejected_requests
@@ -188,6 +192,11 @@ impl Shard {
             return;
         }
         slot.last_used = Instant::now();
+        if self.timing_observer.is_some()
+            && let Request::Command(command) = &mut request
+        {
+            command.queued_at = Some(Instant::now());
+        }
         slot.queue.push_back(request);
         self.metrics
             .accepted_requests
@@ -250,6 +259,12 @@ impl Shard {
         let Some(request) = slot.queue.pop_front() else {
             return;
         };
+        if let (Some(observer), Request::Command(command)) =
+            (self.timing_observer.as_deref(), &request)
+            && let Some(queued_at) = command.queued_at
+        {
+            observer.observe(TimingStage::SchedulerQueue, queued_at.elapsed());
+        }
         match request {
             Request::Read(tx) => {
                 if kind.mode() == Mode::Session {
@@ -286,7 +301,11 @@ impl Shard {
                 self.metrics
                     .commands_executed
                     .fetch_add(1, Ordering::Relaxed);
-                let result = kind.execute(slot.state.as_mut().expect("ready state"), cmd);
+                let result = kind.execute(
+                    slot.state.as_mut().expect("ready state"),
+                    cmd,
+                    self.timing_observer.as_deref(),
+                );
                 match result {
                     Ok(Executed::Session { reply }) => {
                         let _ = req.reply.send(Ok(reply));
@@ -415,7 +434,11 @@ impl Shard {
                         self.metrics
                             .commands_executed
                             .fetch_add(1, Ordering::Relaxed);
-                        let decided = kind.execute(slot.state.as_mut().expect("ready state"), cmd);
+                        let decided = kind.execute(
+                            slot.state.as_mut().expect("ready state"),
+                            cmd,
+                            self.timing_observer.as_deref(),
+                        );
                         match decided {
                             Err(e) => {
                                 if e == ActorError::HandlerPanicked {
@@ -451,6 +474,7 @@ impl Shard {
                                 let hash = request.hash.expect("request hash");
                                 let ownership =
                                     self.ownership.as_ref().expect("owner claimed").clone();
+                                let timing_observer = self.timing_observer.clone();
                                 self.pending.push(
                                     async move {
                                         let result = storage
@@ -466,12 +490,15 @@ impl Shard {
                                                 effects,
                                             })
                                             .await;
+                                        let storage_finished_at =
+                                            timing_observer.as_ref().map(|_| Instant::now());
                                         Completion::Committed {
                                             id,
                                             request,
                                             next,
                                             reply,
                                             new_version,
+                                            storage_finished_at,
                                             result,
                                         }
                                     }
@@ -489,8 +516,14 @@ impl Shard {
                 next,
                 reply,
                 new_version,
+                storage_finished_at,
                 result,
             } => {
+                if let (Some(observer), Some(finished_at)) =
+                    (self.timing_observer.as_deref(), storage_finished_at)
+                {
+                    observer.observe(TimingStage::SchedulerCompletion, finished_at.elapsed());
+                }
                 match result {
                     Ok(CommitResult::Applied) => {
                         self.metrics.durable_commits.fetch_add(1, Ordering::Relaxed);

@@ -61,7 +61,7 @@ Outbox entries are durable delivery intents, not remote procedure calls. Deliver
 
 ## Distribution and migration limits
 
-- Actryn does not provide consensus, membership discovery, automatic failover, dynamic shard placement, or rebalance. `balanced_initial_shards` creates a deterministic initial assignment for a fixed node list only; it does not migrate actor state.
+- Actryn does not provide consensus, membership discovery, automatic failover, dynamic shard placement, or rebalance. `balanced_initial_shards` creates an exactly balanced deterministic assignment for a fixed node list; `rendezvous_initial_shards` minimizes movement as membership changes with approximate balance. Both plan initial ownership only and do not migrate actor state.
 - The experimental RPC transport is loopback-only and has no authentication or TLS. Do not expose it to untrusted networks.
 - Durable state has no built-in schema-version migration mechanism. Applications must keep persisted data compatible with the versions that read it.
 - Keep actor-to-shard placement stable across application versions unless you have an application-owned migration plan. Actryn does not migrate stored state or ownership automatically.

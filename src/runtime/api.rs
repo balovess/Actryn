@@ -2,9 +2,10 @@
 use super::actor::{DurableActor, DurableKind, ErasedKind, Mode, SessionActor, SessionKind};
 use super::metrics::{RuntimeMetrics, ShardMetrics};
 use super::scheduler::{ActorId, CommandRequest, Envelope, Ingress, Request, Shard};
+use super::timing::{SharedTimingObserver, TimingObserver, TimingStage};
 use crate::{
     ActorError, encode,
-    storage::{Ownership, StorageBackend, balanced_initial_shards},
+    storage::{Ownership, StorageBackend, balanced_initial_shards, rendezvous_initial_shards},
 };
 use futures::stream::FuturesUnordered;
 use sha2::{Digest, Sha256};
@@ -16,11 +17,25 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
 const MAX_LEASE_RELEASE_WAIT: Duration = Duration::from_secs(5);
+
+struct TimingGuard<'a> {
+    observer: Option<&'a dyn TimingObserver>,
+    stage: TimingStage,
+    started: Option<Instant>,
+}
+
+impl Drop for TimingGuard<'_> {
+    fn drop(&mut self) {
+        if let (Some(observer), Some(started)) = (self.observer, self.started) {
+            observer.observe(self.stage, started.elapsed());
+        }
+    }
+}
 
 pub struct ActorRuntimeBuilder {
     kinds: HashMap<&'static str, Arc<dyn ErasedKind>>,
@@ -34,6 +49,7 @@ pub struct ActorRuntimeBuilder {
     eviction_interval: Duration,
     shard_claim: Option<ShardClaim>,
     standalone: bool,
+    timing_observer: Option<SharedTimingObserver>,
 }
 
 enum ShardClaim {
@@ -42,11 +58,18 @@ enum ShardClaim {
         shards: Vec<usize>,
         lease: Duration,
     },
-    Balanced {
+    Membership {
         endpoint: String,
         node_ids: Vec<String>,
         lease: Duration,
+        placement: MembershipPlacement,
     },
+}
+
+#[derive(Clone, Copy)]
+enum MembershipPlacement {
+    Balanced,
+    Rendezvous,
 }
 
 impl ActorRuntimeBuilder {
@@ -63,6 +86,7 @@ impl ActorRuntimeBuilder {
             eviction_interval: Duration::from_secs(1),
             shard_claim: None,
             standalone: false,
+            timing_observer: None,
         }
     }
     /// Explicit opt-in to SQLite's single-process development mode.
@@ -92,21 +116,46 @@ impl ActorRuntimeBuilder {
         self
     }
 
-    /// Claim this node's deterministic share from a fixed cluster membership list.
+    /// Claim this node's exactly balanced share from a fixed membership list.
     ///
     /// The node ID set is sorted before assignment, so every node must provide
     /// the same unique IDs. This plans initial ownership only; it does not discover
     /// members, migrate state, or rebalance when membership changes.
     pub fn claim_balanced_shards(
-        mut self,
+        self,
         endpoint: impl Into<String>,
         node_ids: Vec<String>,
         lease: Duration,
     ) -> Self {
-        self.shard_claim = Some(ShardClaim::Balanced {
+        self.claim_membership_shards(endpoint, node_ids, lease, MembershipPlacement::Balanced)
+    }
+
+    /// Claim this node's rendezvous-hashed share from a fixed membership list.
+    ///
+    /// The node ID set is sorted before assignment, so every node must provide
+    /// the same unique IDs. This planner favors minimal shard movement when
+    /// membership changes, but it does not migrate state or rebalance ownership.
+    pub fn claim_rendezvous_shards(
+        self,
+        endpoint: impl Into<String>,
+        node_ids: Vec<String>,
+        lease: Duration,
+    ) -> Self {
+        self.claim_membership_shards(endpoint, node_ids, lease, MembershipPlacement::Rendezvous)
+    }
+
+    fn claim_membership_shards(
+        mut self,
+        endpoint: impl Into<String>,
+        node_ids: Vec<String>,
+        lease: Duration,
+        placement: MembershipPlacement,
+    ) -> Self {
+        self.shard_claim = Some(ShardClaim::Membership {
             endpoint: endpoint.into(),
             node_ids,
             lease,
+            placement,
         });
         self
     }
@@ -134,6 +183,15 @@ impl ActorRuntimeBuilder {
     }
     pub fn activation_limit(mut self, limit: usize) -> Self {
         self.activation_limit = limit;
+        self
+    }
+    /// Enable optional request-stage observations.
+    ///
+    /// The observer runs inline on scheduler and storage tasks. It must be fast,
+    /// non-blocking, and non-panicking. With no observer configured, stage timers
+    /// are not started.
+    pub fn timing_observer(mut self, observer: Arc<dyn TimingObserver>) -> Self {
+        self.timing_observer = Some(observer);
         self
     }
     pub fn idle_timeout(mut self, duration: Duration) -> Self {
@@ -222,13 +280,21 @@ impl ActorRuntimeBuilder {
                     shards,
                     lease,
                 } => Ok((endpoint.clone(), shards.clone(), *lease)),
-                ShardClaim::Balanced {
+                ShardClaim::Membership {
                     endpoint,
                     node_ids,
                     lease,
+                    placement,
                 } => Ok((
                     endpoint.clone(),
-                    balanced_initial_shards(node_ids, &self.node_id)?,
+                    match placement {
+                        MembershipPlacement::Balanced => {
+                            balanced_initial_shards(node_ids, &self.node_id)?
+                        }
+                        MembershipPlacement::Rendezvous => {
+                            rendezvous_initial_shards(node_ids, &self.node_id)?
+                        }
+                    },
                     *lease,
                 )),
             })
@@ -298,6 +364,7 @@ impl ActorRuntimeBuilder {
                 kinds: kinds.clone(),
                 storage: self.storage.clone(),
                 ownership: ownership.clone(),
+                timing_observer: self.timing_observer.clone(),
                 slots: HashMap::new(),
                 ready: VecDeque::new(),
                 pending: FuturesUnordered::new(),
@@ -318,6 +385,7 @@ impl ActorRuntimeBuilder {
             inner: Arc::new(RuntimeInner {
                 senders,
                 kinds,
+                timing_observer: self.timing_observer,
                 #[cfg(feature = "experimental-rpc")]
                 ownership,
                 stopping: AtomicBool::new(false),
@@ -366,6 +434,7 @@ struct LeaseRelease {
 struct RuntimeInner {
     senders: Vec<mpsc::Sender<Ingress>>,
     kinds: Arc<HashMap<&'static str, Arc<dyn ErasedKind>>>,
+    timing_observer: Option<SharedTimingObserver>,
     stopping: AtomicBool,
     #[cfg(feature = "experimental-rpc")]
     ownership: Option<Ownership>,
@@ -388,6 +457,14 @@ pub struct ActorRuntime {
 impl ActorRuntime {
     pub fn builder() -> ActorRuntimeBuilder {
         ActorRuntimeBuilder::new()
+    }
+    fn stage_timer(&self, stage: TimingStage) -> TimingGuard<'_> {
+        let observer = self.inner.timing_observer.as_deref();
+        TimingGuard {
+            observer,
+            stage,
+            started: observer.map(|_| Instant::now()),
+        }
     }
     #[cfg(feature = "experimental-rpc")]
     pub(crate) fn ownership(&self) -> Option<&Ownership> {
@@ -437,10 +514,13 @@ impl ActorRuntime {
     }
     async fn submit(&self, env: Envelope) -> Result<(), ActorError> {
         let idx = shard_index(&env.id, self.inner.senders.len());
-        self.inner.senders[idx]
-            .send(Ingress::Request(env))
-            .await
-            .map_err(|_| ActorError::ShuttingDown)
+        let observer = self.inner.timing_observer.as_deref();
+        let started = observer.map(|_| std::time::Instant::now());
+        let result = self.inner.senders[idx].send(Ingress::Request(env)).await;
+        if let (Some(observer), Some(started)) = (observer, started) {
+            observer.observe(super::timing::TimingStage::IngressQueue, started.elapsed());
+        }
+        result.map_err(|_| ActorError::ShuttingDown)
     }
     /// Process-local telemetry; counters can change during the snapshot.
     /// `live_activations` counts resident slots, not all durable logical actors.
@@ -538,6 +618,7 @@ impl<A: DurableActor> DurableRef<A> {
         request_id: impl Into<String>,
         cmd: A::Command,
     ) -> Result<A::Reply, ActorError> {
+        let _timer = self.runtime.stage_timer(TimingStage::ClientResponse);
         let id = ActorId {
             kind: A::KIND,
             key: self.key.clone(),
@@ -556,6 +637,7 @@ impl<A: DurableActor> DurableRef<A> {
                     command: Some(Box::new(cmd)),
                     request_id: Some(rid),
                     hash: Some(hash),
+                    queued_at: None,
                     reply: tx,
                 }),
             })
@@ -601,6 +683,7 @@ impl<A: SessionActor> Clone for SessionRef<A> {
 }
 impl<A: SessionActor> SessionRef<A> {
     pub async fn command(&self, cmd: A::Command) -> Result<A::Reply, ActorError> {
+        let _timer = self.runtime.stage_timer(TimingStage::ClientResponse);
         let id = ActorId {
             kind: A::KIND,
             key: self.key.clone(),
@@ -614,6 +697,7 @@ impl<A: SessionActor> SessionRef<A> {
                     command: Some(Box::new(cmd)),
                     request_id: None,
                     hash: None,
+                    queued_at: None,
                     reply: tx,
                 }),
             })

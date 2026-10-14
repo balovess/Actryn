@@ -5,14 +5,17 @@
 //! update lock, increments epoch, and therefore cannot pass a concurrent commit.
 //! Every validity check uses PostgreSQL's clock, never the worker clock.
 
-use std::time::Duration;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use deadpool_postgres::{Object, Pool};
 use tokio_postgres::{Transaction, error::SqlState};
 
 use crate::{
-    ActorError,
+    ActorError, TimingObserver, TimingStage,
     outbox::{OutboxRecord, OutboxStore},
     storage::{
         CommitRequest, CommitResult, LOGICAL_SHARDS, Ownership, ShardLocation, StorageAdapter,
@@ -23,6 +26,21 @@ use crate::{
 #[derive(Clone)]
 pub struct PostgresStorage {
     pool: Pool,
+    timing_observer: Option<Arc<dyn TimingObserver>>,
+}
+
+struct StageTimer<'a> {
+    observer: Option<&'a dyn TimingObserver>,
+    stage: TimingStage,
+    started: Option<Instant>,
+}
+
+impl Drop for StageTimer<'_> {
+    fn drop(&mut self) {
+        if let (Some(observer), Some(started)) = (self.observer, self.started) {
+            observer.observe(self.stage, started.elapsed());
+        }
+    }
 }
 
 impl From<PostgresStorage> for super::StorageBackend {
@@ -100,7 +118,28 @@ fn checked_lease(lease: Duration) -> Result<i64, ActorError> {
 impl PostgresStorage {
     /// The caller configures pool credentials and TLS. No implicit NoTls mode.
     pub fn new(pool: Pool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            timing_observer: None,
+        }
+    }
+
+    /// Enable optional timings for durable commit phases.
+    ///
+    /// The observer runs inline on storage tasks. Keep it fast, non-blocking,
+    /// and non-panicking. With no observer configured, phase timers are not started.
+    pub fn with_timing_observer(mut self, observer: Arc<dyn TimingObserver>) -> Self {
+        self.timing_observer = Some(observer);
+        self
+    }
+
+    fn stage_timer(&self, stage: TimingStage) -> StageTimer<'_> {
+        let observer = self.timing_observer.as_deref();
+        StageTimer {
+            observer,
+            stage,
+            started: observer.map(|_| Instant::now()),
+        }
     }
 
     /// Bootstrap for development. Production installations must use versioned
@@ -381,6 +420,7 @@ impl PostgresStorage {
     /// The only path allowed to make a durable command visible. A serialization failure or
     /// deadlock restarts the complete transaction, including lease fencing and receipt lookup.
     pub(crate) async fn commit(&self, request: CommitRequest) -> Result<CommitResult, ActorError> {
+        let _total_timer = self.stage_timer(TimingStage::StorageCommitTotal);
         for attempt in 0..=MAX_TRANSACTION_RETRIES {
             match self.commit_once(&request).await {
                 Ok(result) => return Ok(result),
@@ -403,17 +443,28 @@ impl PostgresStorage {
         let request_id = &request.request_id;
         let hash = &request.request_hash;
         let expected_version = request.expected_version;
-        let mut client = self.client().await.map_err(CommitFailure::Actor)?;
-        let tx = client.transaction().await?;
-        Self::fence(&tx, owner, kind, key).await?;
+        let mut client = {
+            let _timer = self.stage_timer(TimingStage::StoragePoolAcquire);
+            self.client().await.map_err(CommitFailure::Actor)?
+        };
+        let tx = {
+            let _timer = self.stage_timer(TimingStage::StorageTransactionBegin);
+            client.transaction().await?
+        };
+        {
+            let _timer = self.stage_timer(TimingStage::StorageFence);
+            Self::fence(&tx, owner, kind, key).await?;
+        }
 
-        let previous = tx
-            .query_opt(
+        let previous = {
+            let _timer = self.stage_timer(TimingStage::StorageReceiptLookup);
+            tx.query_opt(
                 "SELECT request_hash, reply FROM actor_receipts
              WHERE kind = $1 AND actor_key = $2 AND request_id = $3",
                 &[&kind, key, request_id],
             )
-            .await?;
+            .await?
+        };
         if let Some(row) = previous {
             let prior_hash: Vec<u8> = row.get(0);
             if prior_hash.as_slice() != hash.as_slice() {
@@ -428,50 +479,58 @@ impl PostgresStorage {
                 .checked_add(1)
                 .ok_or(ActorError::VersionConflict)?,
         )?;
-        let written = if expected == 0 {
-            tx.execute(
-                "INSERT INTO actor_states(kind,actor_key,version,payload)
+        {
+            let _timer = self.stage_timer(TimingStage::StorageWrites);
+            let written = if expected == 0 {
+                tx.execute(
+                    "INSERT INTO actor_states(kind,actor_key,version,payload)
                  VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING",
-                &[&kind, key, &next, &request.state],
-            )
-            .await?
-        } else {
-            tx.execute(
-                "UPDATE actor_states SET version = $4, payload = $5
+                    &[&kind, key, &next, &request.state],
+                )
+                .await?
+            } else {
+                tx.execute(
+                    "UPDATE actor_states SET version = $4, payload = $5
                  WHERE kind = $1 AND actor_key = $2 AND version = $3",
-                &[&kind, key, &expected, &next, &request.state],
-            )
-            .await?
-        };
-        if written != 1 {
-            return Ok(CommitResult::VersionConflict);
-        }
+                    &[&kind, key, &expected, &next, &request.state],
+                )
+                .await?
+            };
+            if written != 1 {
+                return Ok(CommitResult::VersionConflict);
+            }
 
-        tx.execute(
-            "INSERT INTO actor_receipts(kind,actor_key,request_id,request_hash,reply)
-             VALUES($1,$2,$3,$4,$5)",
-            &[&kind, key, request_id, &hash.to_vec(), &request.reply],
-        )
-        .await?;
-        for (ordinal, effect) in request.effects.iter().enumerate() {
-            let ordinal = i32::try_from(ordinal).map_err(|_| ActorError::InvalidConfiguration)?;
             tx.execute(
-                "INSERT INTO actor_outbox(kind,actor_key,request_id,ordinal,
-                   destination_kind,destination_key,payload)
-                 VALUES($1,$2,$3,$4,$5,$6,$7)",
-                &[
-                    &kind,
-                    key,
-                    request_id,
-                    &ordinal,
-                    &effect.destination_kind,
-                    &effect.destination_key,
-                    &effect.payload,
-                ],
+                "INSERT INTO actor_receipts(kind,actor_key,request_id,request_hash,reply)
+             VALUES($1,$2,$3,$4,$5)",
+                &[&kind, key, request_id, &hash.to_vec(), &request.reply],
             )
             .await?;
+            for (ordinal, effect) in request.effects.iter().enumerate() {
+                let ordinal =
+                    i32::try_from(ordinal).map_err(|_| ActorError::InvalidConfiguration)?;
+                tx.execute(
+                    "INSERT INTO actor_outbox(kind,actor_key,request_id,ordinal,
+                   destination_kind,destination_key,payload)
+                 VALUES($1,$2,$3,$4,$5,$6,$7)",
+                    &[
+                        &kind,
+                        key,
+                        request_id,
+                        &ordinal,
+                        &effect.destination_kind,
+                        &effect.destination_key,
+                        &effect.payload,
+                    ],
+                )
+                .await?;
+            }
         }
-        match tx.commit().await {
+        let commit_result = {
+            let _timer = self.stage_timer(TimingStage::StorageTransactionCommit);
+            tx.commit().await
+        };
+        match commit_result {
             Ok(()) => Ok(CommitResult::Applied),
             Err(error) if error.code().is_none() => Err(CommitFailure::UnknownOutcome),
             Err(error) => Err(CommitFailure::Database(error)),

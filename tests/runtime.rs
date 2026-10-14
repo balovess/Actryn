@@ -1,4 +1,7 @@
-use actryn::{ActorError, ActorRuntime, Decision, DurableActor, SessionActor, SqliteStorage};
+use actryn::{
+    ActorError, ActorRuntime, Decision, DurableActor, SessionActor, SqliteStorage,
+    rendezvous_initial_shards,
+};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -159,6 +162,56 @@ async fn fixed_membership_builder_claims_a_balanced_initial_plan() {
 
     node_a.shutdown().await.unwrap();
     node_b.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn fixed_membership_builder_claims_a_rendezvous_initial_plan() {
+    let temp = tempfile::tempdir().unwrap();
+    let storage = SqliteStorage::open(temp.path().join("rendezvous-claim.db")).unwrap();
+    let lease = Duration::from_secs(5);
+    let members = vec![
+        "node-c".to_owned(),
+        "node-a".to_owned(),
+        "node-b".to_owned(),
+    ];
+    let mut expected_owners = vec![String::new(); actryn::LOGICAL_SHARDS];
+    let mut runtimes = Vec::new();
+
+    for (index, node_id) in ["node-a", "node-b", "node-c"].into_iter().enumerate() {
+        for shard in rendezvous_initial_shards(&members, node_id).unwrap() {
+            expected_owners[shard] = node_id.to_owned();
+        }
+        runtimes.push(
+            ActorRuntime::builder()
+                .storage(storage.clone())
+                .node_id(node_id)
+                .claim_rendezvous_shards(
+                    format!("127.0.0.1:{}", 8001 + index),
+                    members.clone(),
+                    lease,
+                )
+                .register_durable::<Wallet>()
+                .unwrap()
+                .build()
+                .unwrap(),
+        );
+    }
+
+    for (shard, expected_owner) in expected_owners.into_iter().enumerate() {
+        assert!(
+            !expected_owner.is_empty(),
+            "shard {shard} has no planned owner"
+        );
+        assert_eq!(
+            storage.locate(shard).await.unwrap().unwrap().owner_id,
+            expected_owner,
+            "shard {shard} was claimed by the wrong node"
+        );
+    }
+
+    for runtime in runtimes {
+        runtime.shutdown().await.unwrap();
+    }
 }
 
 #[tokio::test]

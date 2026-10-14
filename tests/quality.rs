@@ -1,10 +1,16 @@
 //! v0.1 regression tests for observability and shutdown semantics.
 use std::{
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
-use actryn::{ActorError, ActorRuntime, Decision, DurableActor, SessionActor, SqliteStorage};
+use actryn::{
+    ActorError, ActorRuntime, Decision, DurableActor, SessionActor, SqliteStorage, TimingObserver,
+    TimingStage,
+};
 use serde::Serialize;
 
 struct Room;
@@ -23,6 +29,42 @@ impl SessionActor for Room {
         state.0 += 1;
         state.0
     }
+}
+
+#[derive(Default)]
+struct TimingSamples(Mutex<Vec<TimingStage>>);
+
+impl TimingObserver for TimingSamples {
+    fn observe(&self, stage: TimingStage, _: Duration) {
+        self.0.lock().unwrap().push(stage);
+    }
+}
+
+#[tokio::test]
+async fn optional_timing_observer_records_scheduler_stages() {
+    let samples = Arc::new(TimingSamples::default());
+    let runtime = ActorRuntime::builder()
+        .timing_observer(samples.clone())
+        .register_session::<Room>()
+        .unwrap()
+        .build()
+        .unwrap();
+
+    assert_eq!(
+        runtime
+            .session::<Room>("observed")
+            .command(Join)
+            .await
+            .unwrap(),
+        1
+    );
+    runtime.shutdown().await.unwrap();
+
+    let samples = samples.0.lock().unwrap();
+    assert!(samples.contains(&TimingStage::IngressQueue));
+    assert!(samples.contains(&TimingStage::SchedulerQueue));
+    assert!(samples.contains(&TimingStage::ActorExecution));
+    assert!(samples.contains(&TimingStage::ClientResponse));
 }
 
 struct Ledger;

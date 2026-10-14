@@ -3,6 +3,7 @@
 //! Ownership, placement, and commit protocol types stay independent of database drivers;
 //! provider-specific code lives in its own submodule.
 use crate::outbox::OutboxEffect;
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 pub mod adapter;
@@ -29,6 +30,42 @@ pub fn balanced_initial_shards<N: AsRef<str>>(
     node_ids: &[N],
     node_id: &str,
 ) -> Result<Vec<usize>, crate::ActorError> {
+    let members = validated_members(node_ids, node_id)?;
+    let owner_index = members
+        .binary_search(&node_id)
+        .map_err(|_| crate::ActorError::InvalidConfiguration)?;
+    Ok((owner_index..LOGICAL_SHARDS)
+        .step_by(members.len())
+        .collect())
+}
+
+/// Assign each logical shard using rendezvous hashing for a fixed membership list.
+///
+/// For each shard, the member with the highest stable score owns it. The same member list
+/// always produces the same plan, and adding or removing a member changes only shards whose
+/// winning score changes. This minimizes movement across membership changes, but shard counts
+/// are approximately balanced rather than exactly equal. Every caller must provide the same
+/// unique IDs. This plans initial ownership only; it does not transfer state or leases.
+pub fn rendezvous_initial_shards<N: AsRef<str>>(
+    node_ids: &[N],
+    node_id: &str,
+) -> Result<Vec<usize>, crate::ActorError> {
+    let members = validated_members(node_ids, node_id)?;
+    Ok((0..LOGICAL_SHARDS)
+        .filter(|&shard| {
+            members
+                .iter()
+                .copied()
+                .max_by_key(|member| (rendezvous_score(shard, member), *member))
+                == Some(node_id)
+        })
+        .collect())
+}
+
+fn validated_members<'a, N: AsRef<str>>(
+    node_ids: &'a [N],
+    node_id: &str,
+) -> Result<Vec<&'a str>, crate::ActorError> {
     if node_ids.is_empty()
         || node_ids.len() > LOGICAL_SHARDS
         || node_id.is_empty()
@@ -48,16 +85,23 @@ pub fn balanced_initial_shards<N: AsRef<str>>(
         return Err(crate::ActorError::InvalidConfiguration);
     }
     members.sort_unstable();
-    if members.windows(2).any(|pair| pair[0] == pair[1]) {
+    if members.windows(2).any(|pair| pair[0] == pair[1]) || members.binary_search(&node_id).is_err()
+    {
         return Err(crate::ActorError::InvalidConfiguration);
     }
+    Ok(members)
+}
 
-    let owner_index = members
-        .binary_search(&node_id)
-        .map_err(|_| crate::ActorError::InvalidConfiguration)?;
-    Ok((owner_index..LOGICAL_SHARDS)
-        .step_by(members.len())
-        .collect())
+fn rendezvous_score(shard: usize, node_id: &str) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"actryn.rendezvous-shards.v1\0");
+    hasher.update((node_id.len() as u64).to_be_bytes());
+    hasher.update(node_id.as_bytes());
+    hasher.update((shard as u64).to_be_bytes());
+    let digest = hasher.finalize();
+    u64::from_be_bytes([
+        digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7],
+    ])
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,7 +186,10 @@ pub enum CommitResult {
 
 #[cfg(test)]
 mod placement_tests {
-    use super::{LOGICAL_SHARDS, balanced_initial_shards, shard_for, stable_actor_hash};
+    use super::{
+        LOGICAL_SHARDS, balanced_initial_shards, rendezvous_initial_shards, shard_for,
+        stable_actor_hash,
+    };
 
     #[test]
     fn fixed_membership_assignment_is_balanced_and_stable() {
@@ -170,6 +217,78 @@ mod placement_tests {
         assert!(balanced_initial_shards(&["node-a", "node-a"], "node-a").is_err());
         assert!(balanced_initial_shards(&["node-a"], "node-b").is_err());
         assert!(balanced_initial_shards(&[""], "").is_err());
+        assert!(rendezvous_initial_shards::<&str>(&[], "node-a").is_err());
+        assert!(rendezvous_initial_shards(&["node-a", "node-a"], "node-a").is_err());
+        assert!(rendezvous_initial_shards(&["node-a"], "node-b").is_err());
+        assert!(rendezvous_initial_shards(&[""], "").is_err());
+    }
+
+    #[test]
+    fn rendezvous_assignment_is_stable_and_limits_membership_churn() {
+        let old_members = ["node-a", "node-b"];
+        let new_members = ["node-a", "node-b", "node-c"];
+        let old_owner = owner_map(&old_members, rendezvous_initial_shards);
+        let new_owner = owner_map(&new_members, rendezvous_initial_shards);
+
+        assert_eq!(
+            old_owner,
+            owner_map(&["node-b", "node-a"], rendezvous_initial_shards)
+        );
+        assert_eq!(
+            new_owner,
+            owner_map(&["node-c", "node-a", "node-b"], rendezvous_initial_shards)
+        );
+        assert!(old_owner.iter().all(|owner| !owner.is_empty()));
+        assert!(new_owner.iter().all(|owner| !owner.is_empty()));
+
+        let moved = old_owner
+            .iter()
+            .zip(&new_owner)
+            .filter(|(old, new)| old != new)
+            .count();
+        assert!(moved < LOGICAL_SHARDS / 2, "moved {moved} shards");
+        assert!(
+            old_owner
+                .iter()
+                .zip(&new_owner)
+                .all(|(old, new)| { new == "node-c" || old == new })
+        );
+
+        let counts = new_members.map(|member| {
+            new_owner
+                .iter()
+                .filter(|owner| owner.as_str() == member)
+                .count()
+        });
+        assert!(counts.iter().all(|&count| count > 0));
+        assert_eq!(
+            moved, counts[2],
+            "adding one member should only move its winning shards"
+        );
+        assert!(
+            counts.iter().max().unwrap() - counts.iter().min().unwrap() <= 48,
+            "unexpected rendezvous shard distribution: {counts:?}"
+        );
+
+        let signature = new_owner.join(",");
+        assert_eq!(
+            stable_actor_hash("rendezvous-plan.v1", &signature),
+            6_097_637_500_881_612_951
+        );
+    }
+
+    fn owner_map<N: AsRef<str>>(
+        members: &[N],
+        assign: fn(&[N], &str) -> Result<Vec<usize>, crate::ActorError>,
+    ) -> Vec<String> {
+        let mut owners = vec![String::new(); LOGICAL_SHARDS];
+        for member in members {
+            for shard in assign(members, member.as_ref()).unwrap() {
+                assert!(owners[shard].is_empty(), "shard {shard} was assigned twice");
+                owners[shard] = member.as_ref().to_owned();
+            }
+        }
+        owners
     }
 
     #[test]

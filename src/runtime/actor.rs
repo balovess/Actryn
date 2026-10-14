@@ -1,11 +1,13 @@
 //! User actor contracts and the private typed-to-erased adapter.
 //! The scheduler never downcasts domain state itself.
+use super::timing::{TimingObserver, TimingStage};
 use crate::{ActorError, Decision, OutboxEffect, decode, encode};
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
     any::{Any, TypeId},
     marker::PhantomData,
     panic::{AssertUnwindSafe, catch_unwind},
+    time::Instant,
 };
 
 pub(super) type Erased = Box<dyn Any + Send>;
@@ -65,7 +67,12 @@ pub(super) trait ErasedKind: Send + Sync {
     fn initial(&self, key: &str) -> Result<Erased, ActorError>;
     fn decode_state(&self, bytes: &[u8]) -> Result<Erased, ActorError>;
     fn clone_state(&self, state: &Erased) -> Result<Erased, ActorError>;
-    fn execute(&self, state: &mut Erased, command: Erased) -> Result<Executed, ActorError>;
+    fn execute(
+        &self,
+        state: &mut Erased,
+        command: Erased,
+        observer: Option<&dyn TimingObserver>,
+    ) -> Result<Executed, ActorError>;
     fn decode_reply(&self, bytes: &[u8]) -> Result<Erased, ActorError>;
 }
 
@@ -89,20 +96,34 @@ impl<A: DurableActor> ErasedKind for DurableKind<A> {
             .ok_or(ActorError::TypeMismatch)?;
         Ok(Box::new(user_call(|| state.clone())?))
     }
-    fn execute(&self, state: &mut Erased, command: Erased) -> Result<Executed, ActorError> {
+    fn execute(
+        &self,
+        state: &mut Erased,
+        command: Erased,
+        observer: Option<&dyn TimingObserver>,
+    ) -> Result<Executed, ActorError> {
         let state = state
             .downcast_ref::<A::State>()
             .ok_or(ActorError::TypeMismatch)?;
         let command = *command
             .downcast::<A::Command>()
             .map_err(|_| ActorError::TypeMismatch)?;
+        let execution_started = observer.map(|_| Instant::now());
+        let decision = user_call(|| A::decide(state, command));
+        if let (Some(observer), Some(started)) = (observer, execution_started) {
+            observer.observe(TimingStage::ActorExecution, started.elapsed());
+        }
         let Decision {
             next_state,
             reply,
             effects,
-        } = user_call(|| A::decide(state, command))??;
-        let state_bytes = encode(&next_state)?;
-        let reply_bytes = encode(&reply)?;
+        } = decision??;
+        let serialization_started = observer.map(|_| Instant::now());
+        let serialized = (|| Ok((encode(&next_state)?, encode(&reply)?)))();
+        if let (Some(observer), Some(started)) = (observer, serialization_started) {
+            observer.observe(TimingStage::Serialization, started.elapsed());
+        }
+        let (state_bytes, reply_bytes) = serialized?;
         Ok(Executed::Durable {
             next: Box::new(next_state),
             reply: Box::new(reply),
@@ -136,14 +157,24 @@ impl<A: SessionActor> ErasedKind for SessionKind<A> {
             .ok_or(ActorError::TypeMismatch)?;
         Ok(Box::new(user_call(|| state.clone())?))
     }
-    fn execute(&self, state: &mut Erased, command: Erased) -> Result<Executed, ActorError> {
+    fn execute(
+        &self,
+        state: &mut Erased,
+        command: Erased,
+        observer: Option<&dyn TimingObserver>,
+    ) -> Result<Executed, ActorError> {
         let state = state
             .downcast_mut::<A::State>()
             .ok_or(ActorError::TypeMismatch)?;
         let command = *command
             .downcast::<A::Command>()
             .map_err(|_| ActorError::TypeMismatch)?;
-        let reply = user_call(|| A::handle(state, command))?;
+        let started = observer.map(|_| Instant::now());
+        let reply = user_call(|| A::handle(state, command));
+        if let (Some(observer), Some(started)) = (observer, started) {
+            observer.observe(TimingStage::ActorExecution, started.elapsed());
+        }
+        let reply = reply?;
         Ok(Executed::Session {
             reply: Box::new(reply),
         })

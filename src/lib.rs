@@ -20,13 +20,13 @@ pub mod storage;
 pub use outbox::{Decision, OutboxEffect, OutboxRecord, OutboxSink, OutboxStore, dispatch_outbox};
 pub use runtime::{
     ActorRuntime, ActorRuntimeBuilder, DurableActor, DurableRef, RuntimeMetrics, SessionActor,
-    SessionRef,
+    SessionRef, TimingObserver, TimingStage,
 };
 #[cfg(feature = "postgres")]
 pub use storage::PostgresStorage;
 pub use storage::{
     CommitRequest, CommitResult, LOGICAL_SHARDS, Ownership, ShardLocation, SqliteStorage,
-    StorageAdapter, StorageBackend, balanced_initial_shards,
+    StorageAdapter, StorageBackend, balanced_initial_shards, rendezvous_initial_shards,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
