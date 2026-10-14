@@ -1,0 +1,24 @@
+[package]
+name = "actryn-test"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+description = "Development-time contract tests for Actryn storage adapters"
+repository = "https://github.com/balovess/Actryn"
+
+[features]
+default = []
+postgres = ["actryn/postgres", "dep:deadpool-postgres", "dep:tokio-postgres"]
+experimental-rpc = ["actryn/experimental-rpc"]
+
+[dependencies]
+actryn = { path = "..", version = "0.1.0" }
+async-trait = "0.1"
+deadpool-postgres = { version = "0.14", optional = true }
+tokio-postgres = { version = "0.7", optional = true }
+tokio = { version = "1", features = ["time"] }
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

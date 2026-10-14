@@ -1,0 +1,39 @@
+[workspace]
+members = ["actryn-test"]
+resolver = "3"
+
+[package]
+name = "actryn"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+description = "Actryn: experimental Rust virtual actor runtime with durable and session actors"
+repository = "https://github.com/balovess/Actryn"
+readme = "README.md"
+keywords = ["actor", "virtual-actor", "runtime", "async", "storage"]
+categories = ["asynchronous", "concurrency"]
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
+futures = "0.3"
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+async-trait = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = []
+experimental-rpc = []
+postgres = ["dep:deadpool-postgres", "dep:tokio-postgres"]
+
+[dependencies.deadpool-postgres]
+version = "0.14"
+optional = true
+
+[dependencies.tokio-postgres]
+version = "0.7"
+optional = true
