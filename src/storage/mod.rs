@@ -19,6 +19,47 @@ pub use sqlite::SqliteStorage;
 
 pub const LOGICAL_SHARDS: usize = 256;
 
+/// Assign each logical shard to one node in a fixed membership list.
+///
+/// Node IDs are sorted lexicographically and shard `s` is assigned to node
+/// `s % node_ids.len()`. Every caller must use the same node list. This helper
+/// only plans initial ownership; changing membership does not transfer actor
+/// state and is not a rebalance operation.
+pub fn balanced_initial_shards<N: AsRef<str>>(
+    node_ids: &[N],
+    node_id: &str,
+) -> Result<Vec<usize>, crate::ActorError> {
+    if node_ids.is_empty()
+        || node_ids.len() > LOGICAL_SHARDS
+        || node_id.is_empty()
+        || node_id.len() > 256
+    {
+        return Err(crate::ActorError::InvalidConfiguration);
+    }
+
+    let mut members = node_ids
+        .iter()
+        .map(|node_id| node_id.as_ref())
+        .collect::<Vec<_>>();
+    if members
+        .iter()
+        .any(|member| member.is_empty() || member.len() > 256)
+    {
+        return Err(crate::ActorError::InvalidConfiguration);
+    }
+    members.sort_unstable();
+    if members.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(crate::ActorError::InvalidConfiguration);
+    }
+
+    let owner_index = members
+        .binary_search(&node_id)
+        .map_err(|_| crate::ActorError::InvalidConfiguration)?;
+    Ok((owner_index..LOGICAL_SHARDS)
+        .step_by(members.len())
+        .collect())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShardLocation {
     pub shard: usize,
@@ -101,7 +142,35 @@ pub enum CommitResult {
 
 #[cfg(test)]
 mod placement_tests {
-    use super::{LOGICAL_SHARDS, shard_for, stable_actor_hash};
+    use super::{LOGICAL_SHARDS, balanced_initial_shards, shard_for, stable_actor_hash};
+
+    #[test]
+    fn fixed_membership_assignment_is_balanced_and_stable() {
+        let members = ["node-c", "node-a", "node-b"];
+        let mut assigned = Vec::new();
+        for node_id in ["node-a", "node-b", "node-c"] {
+            assigned.extend(balanced_initial_shards(&members, node_id).unwrap());
+        }
+        assigned.sort_unstable();
+        assert_eq!(assigned, (0..LOGICAL_SHARDS).collect::<Vec<_>>());
+
+        assert_eq!(
+            balanced_initial_shards(&["node-b", "node-a"], "node-a").unwrap(),
+            (0..LOGICAL_SHARDS).step_by(2).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            balanced_initial_shards(&["node-a", "node-b"], "node-b").unwrap(),
+            (1..LOGICAL_SHARDS).step_by(2).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn fixed_membership_assignment_rejects_invalid_member_sets() {
+        assert!(balanced_initial_shards::<&str>(&[], "node-a").is_err());
+        assert!(balanced_initial_shards(&["node-a", "node-a"], "node-a").is_err());
+        assert!(balanced_initial_shards(&["node-a"], "node-b").is_err());
+        assert!(balanced_initial_shards(&[""], "").is_err());
+    }
 
     #[test]
     fn placement_is_stable_across_compiler_and_process_versions() {

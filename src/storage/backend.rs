@@ -73,6 +73,14 @@ impl StorageBackend {
         self.adapter.renew_selected(ownership, shards, lease).await
     }
 
+    pub(crate) async fn release_selected(
+        &self,
+        ownership: Ownership,
+        shards: Vec<usize>,
+    ) -> Result<(), ActorError> {
+        self.adapter.release_selected(ownership, shards).await
+    }
+
     pub async fn locate(&self, shard: usize) -> Result<Option<ShardLocation>, ActorError> {
         self.adapter.locate(shard).await
     }
@@ -167,6 +175,14 @@ impl StorageAdapter for StorageBackend {
         lease: Duration,
     ) -> Result<(), ActorError> {
         self.adapter.renew_selected(ownership, shards, lease).await
+    }
+
+    async fn release_selected(
+        &self,
+        ownership: Ownership,
+        shards: Vec<usize>,
+    ) -> Result<(), ActorError> {
+        self.adapter.release_selected(ownership, shards).await
     }
 
     async fn locate(&self, shard: usize) -> Result<Option<ShardLocation>, ActorError> {

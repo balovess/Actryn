@@ -3,6 +3,7 @@
 //! Implementations can use embedded or remote databases. A successful [`StorageAdapter::commit`]
 //! must atomically persist the next state, request receipt, and every outbox effect, while
 //! validating both ownership fencing and the expected state version in the same transaction.
+//! Lease release must also validate the current owner and fencing epoch atomically.
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -64,6 +65,17 @@ pub trait StorageAdapter: OutboxStore + Send + Sync + 'static {
     ) -> Result<(), ActorError> {
         Err(ActorError::InvalidConfiguration)
     }
+
+    /// Release a selected shard set after its runtime has drained accepted work.
+    ///
+    /// Implementations must atomically verify owner and fencing epochs for the full set before
+    /// making the leases available to another owner. A runtime bounds this best-effort shutdown
+    /// call; an error or timeout leaves the leases to expire normally.
+    async fn release_selected(
+        &self,
+        ownership: Ownership,
+        shards: Vec<usize>,
+    ) -> Result<(), ActorError>;
 
     /// Look up an unexpired owner for a logical shard.
     async fn locate(&self, shard: usize) -> Result<Option<ShardLocation>, ActorError>;

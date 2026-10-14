@@ -40,7 +40,9 @@ The scheduler gives each ready actor one turn per visit, then schedules it again
 
 Storage providers validate the current shard owner and fencing token before allowing reads or writes. A durable commit also checks the expected state version, deduplicates the request ID, and writes state, receipt, and effects atomically. The provider contract and retry behavior are described in [CONTRACTS.md](CONTRACTS.md).
 
-When an application explicitly assigns shards to a runtime, the runtime renews those leases. A renewal error or timeout causes that runtime to fail closed for durable work. Actryn does not select a replacement owner or move shards automatically.
+When an application explicitly assigns shards to a runtime, the runtime renews those leases. A renewal error or timeout causes that runtime to fail closed for durable work. After draining accepted work during shutdown, the runtime attempts a fenced lease release so another node can claim the shards without waiting for expiry. If release fails, the leases expire normally. Actryn does not select a replacement owner or move shards automatically.
+
+For a fixed cluster membership, applications can use `balanced_initial_shards` or `claim_balanced_shards` to derive a deterministic, even initial assignment. Every node must use the same member IDs. This does not discover members or transfer state; changing the member list requires an application-owned migration.
 
 The experimental cluster client caches shard routes for up to five seconds. For remote calls, a routing or transport failure invalidates the observed route, looks up placement again, and retries once. If a locally handled call reports an ownership failure, the client drops that route and returns the error; the next call resolves placement again. The cache is only a routing hint: storage fencing remains the authority for reads and commits, and Actryn does not perform automatic failover.
 

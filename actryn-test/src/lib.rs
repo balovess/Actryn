@@ -90,6 +90,14 @@ pub mod faults {
             self.inner.renew_selected(ownership, shards, lease).await
         }
 
+        async fn release_selected(
+            &self,
+            ownership: Ownership,
+            shards: Vec<usize>,
+        ) -> Result<(), ActorError> {
+            self.inner.release_selected(ownership, shards).await
+        }
+
         async fn locate(&self, shard: usize) -> Result<Option<ShardLocation>, ActorError> {
             self.inner.locate(shard).await
         }
@@ -182,8 +190,8 @@ pub mod storage {
     /// Exercise the core lease, fencing, version, receipt, duplicate, and outbox guarantees.
     ///
     /// The verifier claims one currently available logical shard with a unique owner and uses
-    /// unique actor and request IDs. The lease expires after 30 seconds; adapters should run this
-    /// against a dedicated test database because it writes durable test records.
+    /// unique actor and request IDs, then releases its lease. Adapters should run this against a
+    /// dedicated test database because it writes durable test records.
     pub async fn verify<A: StorageAdapter>(adapter: &A) -> Result<(), ContractError> {
         let run_id = unique_id();
         let node_id = format!("actryn-test-{run_id}");
@@ -551,15 +559,96 @@ pub mod storage {
             .map(|index| ownership.epoch_for_shard(index).unwrap_or_default())
             .collect();
         forged_epochs[shard] = forged_epochs[shard].saturating_add(1);
-        let stale_owner =
-            Ownership::new(node_id, forged_epochs).map_err(|source| ContractError::Adapter {
+        let stale_owner = Ownership::new(node_id.clone(), forged_epochs).map_err(|source| {
+            ContractError::Adapter {
                 operation: "construct a stale fencing token",
                 source,
-            })?;
-        let stale_fence = adapter.check_fence(stale_owner, kind, key).await;
+            }
+        })?;
+        let stale_fence = adapter.check_fence(stale_owner, kind, key.clone()).await;
         if !matches!(stale_fence, Err(ActorError::OwnershipLost)) {
             return Err(ContractError::Violation(
                 "a stale fencing epoch was not rejected with OwnershipLost",
+            ));
+        }
+
+        adapter
+            .release_selected(ownership.clone(), vec![shard])
+            .await
+            .map_err(|source| ContractError::Adapter {
+                operation: "release a current shard lease",
+                source,
+            })?;
+        if adapter
+            .locate(shard)
+            .await
+            .map_err(|source| ContractError::Adapter {
+                operation: "verify a released shard lease",
+                source,
+            })?
+            .is_some()
+        {
+            return Err(ContractError::Violation(
+                "a released shard lease remained available to the old owner",
+            ));
+        }
+        let takeover_id = format!("actryn-test-takeover-{run_id}");
+        let takeover = adapter
+            .claim_selected(
+                &takeover_id,
+                "actryn-test://takeover-owner",
+                &[shard],
+                lease,
+            )
+            .await
+            .map_err(|source| ContractError::Adapter {
+                operation: "claim a released shard lease",
+                source,
+            })?;
+        if takeover.epoch_for_shard(shard).unwrap_or_default()
+            <= ownership.epoch_for_shard(shard).unwrap_or_default()
+        {
+            return Err(ContractError::Violation(
+                "taking over a released shard did not advance its fencing epoch",
+            ));
+        }
+        if !matches!(
+            adapter
+                .release_selected(ownership.clone(), vec![shard])
+                .await,
+            Err(ActorError::OwnershipLost)
+        ) {
+            return Err(ContractError::Violation(
+                "a stale owner released a newer owner's shard lease",
+            ));
+        }
+        let takeover_location =
+            adapter
+                .locate(shard)
+                .await
+                .map_err(|source| ContractError::Adapter {
+                    operation: "verify ownership after a stale release attempt",
+                    source,
+                })?;
+        if !takeover_location.is_some_and(|current| {
+            current.owner_id == takeover_id
+                && current.epoch == takeover.epoch_for_shard(shard).unwrap_or_default()
+        }) {
+            return Err(ContractError::Violation(
+                "a stale release attempt changed the current shard owner",
+            ));
+        }
+        adapter
+            .release_selected(takeover, vec![shard])
+            .await
+            .map_err(|source| ContractError::Adapter {
+                operation: "release the takeover shard lease",
+                source,
+            })?;
+        let released_fence = adapter.check_fence(ownership, kind, key).await;
+        if !matches!(released_fence, Err(ActorError::OwnershipLost)) {
+            return Err(ContractError::Violation(
+                "a released shard lease remained valid for durable operations",
             ));
         }
 

@@ -125,6 +125,76 @@ async fn selected_shard_lease_renews_without_rpc_server() {
     runtime.shutdown().await.unwrap();
 }
 
+#[tokio::test]
+async fn fixed_membership_builder_claims_a_balanced_initial_plan() {
+    let temp = tempfile::tempdir().unwrap();
+    let storage = SqliteStorage::open(temp.path().join("balanced-claim.db")).unwrap();
+    let lease = Duration::from_secs(5);
+    let members = vec!["node-b".to_owned(), "node-a".to_owned()];
+
+    let node_a = ActorRuntime::builder()
+        .storage(storage.clone())
+        .claim_balanced_shards("127.0.0.1:8001", members.clone(), lease)
+        .node_id("node-a")
+        .register_durable::<Wallet>()
+        .unwrap()
+        .build()
+        .unwrap();
+    let node_b = ActorRuntime::builder()
+        .storage(storage.clone())
+        .node_id("node-b")
+        .claim_balanced_shards("127.0.0.1:8002", members, lease)
+        .register_durable::<Wallet>()
+        .unwrap()
+        .build()
+        .unwrap();
+
+    for shard in 0..actryn::LOGICAL_SHARDS {
+        let expected_owner = if shard % 2 == 0 { "node-a" } else { "node-b" };
+        assert_eq!(
+            storage.locate(shard).await.unwrap().unwrap().owner_id,
+            expected_owner
+        );
+    }
+
+    node_a.shutdown().await.unwrap();
+    node_b.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn graceful_shutdown_releases_selected_shards_for_immediate_takeover() {
+    let temp = tempfile::tempdir().unwrap();
+    let storage = SqliteStorage::open(temp.path().join("lease-release.db")).unwrap();
+    let lease = Duration::from_secs(60);
+
+    let node_a = ActorRuntime::builder()
+        .storage(storage.clone())
+        .node_id("node-a")
+        .claim_shards("127.0.0.1:8001", vec![0], lease)
+        .register_durable::<Wallet>()
+        .unwrap()
+        .build()
+        .unwrap();
+    assert_eq!(storage.locate(0).await.unwrap().unwrap().owner_id, "node-a");
+
+    node_a.shutdown().await.unwrap();
+    assert!(storage.locate(0).await.unwrap().is_none());
+
+    let node_b = ActorRuntime::builder()
+        .storage(storage.clone())
+        .node_id("node-b")
+        .claim_shards("127.0.0.1:8002", vec![0], lease)
+        .register_durable::<Wallet>()
+        .unwrap()
+        .build()
+        .unwrap();
+    let location = storage.locate(0).await.unwrap().unwrap();
+    assert_eq!(location.owner_id, "node-b");
+    assert_eq!(location.epoch, 2);
+
+    node_b.shutdown().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mixed_kinds_share_scheduler_without_cross_actor_blocking() {
     let temp = tempfile::tempdir().unwrap();

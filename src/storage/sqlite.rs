@@ -280,6 +280,50 @@ impl SqliteStorage {
         .map_err(join_err)?
     }
 
+    pub(crate) async fn release_selected(
+        &self,
+        ownership: Ownership,
+        shards: Vec<usize>,
+    ) -> Result<(), ActorError> {
+        if shards.is_empty()
+            || shards
+                .iter()
+                .any(|&shard| shard >= LOGICAL_SHARDS || ownership.epochs[shard] == 0)
+        {
+            return Err(ActorError::InvalidConfiguration);
+        }
+        let connection = self.connection.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut unique = shards;
+            unique.sort_unstable();
+            unique.dedup();
+
+            let mut conn = connection
+                .lock()
+                .map_err(|_| ActorError::Storage("poisoned mutex".into()))?;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(db_err)?;
+            let sql = format!(
+                "UPDATE shard_owners SET expires_at_ms=({DB_NOW})
+                 WHERE shard_id=?1 AND owner_id=?2 AND epoch=?3
+                   AND expires_at_ms > ({DB_NOW})"
+            );
+            for shard in unique {
+                let epoch = as_i64(ownership.epochs[shard])?;
+                let updated = tx
+                    .execute(&sql, params![shard as i64, ownership.owner.as_ref(), epoch])
+                    .map_err(db_err)?;
+                if updated != 1 {
+                    return Err(ActorError::OwnershipLost);
+                }
+            }
+            tx.commit().map_err(db_err)
+        })
+        .await
+        .map_err(join_err)?
+    }
+
     pub async fn locate(&self, shard: usize) -> Result<Option<ShardLocation>, ActorError> {
         if shard >= LOGICAL_SHARDS {
             return Err(ActorError::InvalidConfiguration);
@@ -616,6 +660,14 @@ impl StorageAdapter for SqliteStorage {
         lease: Duration,
     ) -> Result<(), ActorError> {
         SqliteStorage::renew_selected(self, ownership, shards, lease).await
+    }
+
+    async fn release_selected(
+        &self,
+        ownership: Ownership,
+        shards: Vec<usize>,
+    ) -> Result<(), ActorError> {
+        SqliteStorage::release_selected(self, ownership, shards).await
     }
 
     async fn locate(&self, shard: usize) -> Result<Option<ShardLocation>, ActorError> {

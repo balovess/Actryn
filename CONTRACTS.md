@@ -20,6 +20,7 @@ A provider may use an embedded or remote database. It may support durable actors
 3. **Fenced reads:** state reads and receipt lookups reject expired or superseded ownership.
 4. **Atomic ownership:** claims and renewals succeed or fail for the requested shard set as a whole. Use the database clock for lease comparisons when available.
 5. **Durable acknowledgements:** outbox acknowledgements are persisted. Delivery remains at-least-once.
+6. **Fenced release:** releasing a shard set checks the current owner and fencing epoch for the whole set atomically. A stale owner must never expire a newer owner's lease.
 
 Connecting a database driver does not make a provider safe for durable actors. Providers must uphold the transaction, isolation, and fencing guarantees above and document any limitations.
 
@@ -39,7 +40,7 @@ Runtimes that claim shards renew those leases automatically. Renewal attempts ar
 
 The experimental cluster client caches shard placement for up to five seconds. For a remote call, a routing or transport failure invalidates the route it used, performs one fresh lookup, and retries at most once. A locally handled ownership failure evicts that route and returns the original error; the next call resolves placement again. Remote command retries preserve the original request ID and payload so an ambiguous commit remains idempotent. Cached placement is not proof of ownership; the provider's fencing checks remain authoritative.
 
-In-flight durable operations remain protected by the provider's fencing checks. During shutdown, lease renewal remains active while accepted work drains, then stops.
+In-flight durable operations remain protected by the provider's fencing checks. During shutdown, lease renewal remains active while accepted work drains, then stops. After a successful drain, the runtime makes a bounded attempt to release explicitly claimed leases using their owner and fencing epochs. If release fails or times out, the lease expires normally.
 
 ## Provider notes
 
@@ -60,7 +61,7 @@ Outbox entries are durable delivery intents, not remote procedure calls. Deliver
 
 ## Distribution and migration limits
 
-- Actryn does not provide consensus, membership, automatic failover, shard placement, or rebalance.
+- Actryn does not provide consensus, membership discovery, automatic failover, dynamic shard placement, or rebalance. `balanced_initial_shards` creates a deterministic initial assignment for a fixed node list only; it does not migrate actor state.
 - The experimental RPC transport is loopback-only and has no authentication or TLS. Do not expose it to untrusted networks.
 - Durable state has no built-in schema-version migration mechanism. Applications must keep persisted data compatible with the versions that read it.
 - Keep actor-to-shard placement stable across application versions unless you have an application-owned migration plan. Actryn does not migrate stored state or ownership automatically.

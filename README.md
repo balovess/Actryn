@@ -28,7 +28,7 @@ Durable commands use request IDs for deduplication. If a storage or transport fa
 
 ## Important limitations
 
-- Actryn does not provide consensus, membership, automatic failover, or shard placement and rebalance.
+- Actryn does not provide consensus, membership discovery, automatic failover, dynamic placement, or rebalance. It can derive an even initial assignment from a fixed list of node IDs.
 - SQLite is for single-host use. PostgreSQL adds shared persistence and shard fencing, but does not make the experimental RPC transport production-ready.
 - A custom database adapter is suitable for durable actors only if it atomically commits state, request receipts, and outbox effects while enforcing ownership and version checks. Connecting a database driver alone does not provide these guarantees.
 - The experimental RPC listener is loopback-only and has no transport authentication or TLS. Do not expose it to an untrusted network.
@@ -49,7 +49,7 @@ The example opens `actryn-demo.sqlite`, updates durable inventory, and mutates a
 
 ## Storage providers
 
-Pass a storage adapter to `ActorRuntimeBuilder::storage`. Adapters with local synchronous ownership claims can be used with `build()`. Asynchronous or remote providers use `build_async()` with explicit shard assignments. When a runtime claims shards, it renews those leases automatically and fails closed if renewal fails or times out. This does not provide placement or automatic failover.
+Pass a storage adapter to `ActorRuntimeBuilder::storage`. Adapters with local synchronous ownership claims can be used with `build()`. Asynchronous or remote providers use `build_async()` with explicit shard assignments. For a fixed node list, `balanced_initial_shards` computes each node's initial share, or `claim_balanced_shards` passes that share directly to the builder. Every node must use the same IDs. Changing membership does not transfer actor state and requires an application-managed migration. When a runtime claims shards, it renews those leases automatically and fails closed if renewal fails or times out. After shutdown drains accepted work, it attempts a fenced lease release; a failed release leaves the lease to expire normally.
 
 Each adapter owns its database driver, schema, transaction behavior, and error mapping. For durable actors, it must meet the full [storage contract](CONTRACTS.md#storage-provider-requirements).
 

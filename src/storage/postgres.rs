@@ -202,6 +202,44 @@ impl PostgresStorage {
         Ok(())
     }
 
+    pub(crate) async fn release_selected(
+        &self,
+        owner: Ownership,
+        shards: Vec<usize>,
+    ) -> Result<(), ActorError> {
+        if shards.is_empty()
+            || shards
+                .iter()
+                .any(|shard| *shard >= LOGICAL_SHARDS || owner.epochs[*shard] == 0)
+        {
+            return Err(ActorError::InvalidConfiguration);
+        }
+        let mut unique = shards;
+        unique.sort_unstable();
+        unique.dedup();
+
+        let mut client = self.client().await?;
+        let tx = client.transaction().await.map_err(db_error)?;
+        for shard in unique {
+            let shard_id = shard as i32;
+            let epoch = as_i64(owner.epochs[shard])?;
+            let updated = tx
+                .execute(
+                    "UPDATE shard_leases SET expires_at = clock_timestamp()
+                 WHERE shard_id = $1 AND owner_id = $2 AND epoch = $3
+                   AND expires_at > clock_timestamp()",
+                    &[&shard_id, &owner.owner.as_ref(), &epoch],
+                )
+                .await
+                .map_err(db_error)?;
+            if updated != 1 {
+                return Err(ActorError::OwnershipLost);
+            }
+        }
+        tx.commit().await.map_err(db_error)?;
+        Ok(())
+    }
+
     pub async fn locate(&self, shard: usize) -> Result<Option<ShardLocation>, ActorError> {
         if shard >= LOGICAL_SHARDS {
             return Err(ActorError::InvalidConfiguration);
@@ -513,6 +551,14 @@ impl StorageAdapter for PostgresStorage {
         lease: Duration,
     ) -> Result<(), ActorError> {
         PostgresStorage::renew_selected(self, ownership, shards, lease).await
+    }
+
+    async fn release_selected(
+        &self,
+        ownership: Ownership,
+        shards: Vec<usize>,
+    ) -> Result<(), ActorError> {
+        PostgresStorage::release_selected(self, ownership, shards).await
     }
 
     async fn locate(&self, shard: usize) -> Result<Option<ShardLocation>, ActorError> {

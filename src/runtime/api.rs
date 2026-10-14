@@ -4,7 +4,7 @@ use super::metrics::{RuntimeMetrics, ShardMetrics};
 use super::scheduler::{ActorId, CommandRequest, Envelope, Ingress, Request, Shard};
 use crate::{
     ActorError, encode,
-    storage::{Ownership, StorageBackend},
+    storage::{Ownership, StorageBackend, balanced_initial_shards},
 };
 use futures::stream::FuturesUnordered;
 use sha2::{Digest, Sha256};
@@ -20,6 +20,8 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
+const MAX_LEASE_RELEASE_WAIT: Duration = Duration::from_secs(5);
+
 pub struct ActorRuntimeBuilder {
     kinds: HashMap<&'static str, Arc<dyn ErasedKind>>,
     storage: Option<StorageBackend>,
@@ -30,8 +32,21 @@ pub struct ActorRuntimeBuilder {
     activation_limit: usize,
     idle_timeout: Duration,
     eviction_interval: Duration,
-    shard_claim: Option<(String, Vec<usize>, Duration)>,
+    shard_claim: Option<ShardClaim>,
     standalone: bool,
+}
+
+enum ShardClaim {
+    Selected {
+        endpoint: String,
+        shards: Vec<usize>,
+        lease: Duration,
+    },
+    Balanced {
+        endpoint: String,
+        node_ids: Vec<String>,
+        lease: Duration,
+    },
 }
 
 impl ActorRuntimeBuilder {
@@ -69,7 +84,30 @@ impl ActorRuntimeBuilder {
         shards: Vec<usize>,
         lease: Duration,
     ) -> Self {
-        self.shard_claim = Some((endpoint.into(), shards, lease));
+        self.shard_claim = Some(ShardClaim::Selected {
+            endpoint: endpoint.into(),
+            shards,
+            lease,
+        });
+        self
+    }
+
+    /// Claim this node's deterministic share from a fixed cluster membership list.
+    ///
+    /// The node ID set is sorted before assignment, so every node must provide
+    /// the same unique IDs. This plans initial ownership only; it does not discover
+    /// members, migrate state, or rebalance when membership changes.
+    pub fn claim_balanced_shards(
+        mut self,
+        endpoint: impl Into<String>,
+        node_ids: Vec<String>,
+        lease: Duration,
+    ) -> Self {
+        self.shard_claim = Some(ShardClaim::Balanced {
+            endpoint: endpoint.into(),
+            node_ids,
+            lease,
+        });
         self
     }
     /// Install a durable storage backend. Both backends share the same runtime.
@@ -136,10 +174,11 @@ impl ActorRuntimeBuilder {
     /// Synchronous construction supports adapters that implement local shard claiming.
     /// Remote adapters should use [`Self::build_async`].
     pub fn build(self) -> Result<ActorRuntime, ActorError> {
-        self.validate()?;
+        let shard_claim = self.resolved_shard_claim()?;
+        self.validate(&shard_claim)?;
         let ownership = if self.has_durable() {
             let store = self.storage.as_ref().expect("validated");
-            Some(match &self.shard_claim {
+            Some(match &shard_claim {
                 Some((endpoint, shards, lease)) => {
                     store.claim_selected_local(&self.node_id, endpoint, shards, *lease)?
                 }
@@ -149,16 +188,17 @@ impl ActorRuntimeBuilder {
         } else {
             None
         };
-        Ok(self.spawn(ownership))
+        Ok(self.spawn(ownership, shard_claim))
     }
 
     /// Asynchronous construction supports local and remote adapters. Remote adapters should
     /// claim explicit shard assignments instead of silently taking over all shards.
     pub async fn build_async(self) -> Result<ActorRuntime, ActorError> {
-        self.validate()?;
+        let shard_claim = self.resolved_shard_claim()?;
+        self.validate(&shard_claim)?;
         let ownership = if self.has_durable() {
             let store = self.storage.as_ref().expect("validated");
-            Some(match &self.shard_claim {
+            Some(match &shard_claim {
                 Some((endpoint, shards, lease)) => {
                     store
                         .claim_selected(&self.node_id, endpoint, shards, *lease)
@@ -170,14 +210,39 @@ impl ActorRuntimeBuilder {
         } else {
             None
         };
-        Ok(self.spawn(ownership))
+        Ok(self.spawn(ownership, shard_claim))
+    }
+
+    fn resolved_shard_claim(&self) -> Result<Option<(String, Vec<usize>, Duration)>, ActorError> {
+        self.shard_claim
+            .as_ref()
+            .map(|claim| match claim {
+                ShardClaim::Selected {
+                    endpoint,
+                    shards,
+                    lease,
+                } => Ok((endpoint.clone(), shards.clone(), *lease)),
+                ShardClaim::Balanced {
+                    endpoint,
+                    node_ids,
+                    lease,
+                } => Ok((
+                    endpoint.clone(),
+                    balanced_initial_shards(node_ids, &self.node_id)?,
+                    *lease,
+                )),
+            })
+            .transpose()
     }
 
     fn has_durable(&self) -> bool {
         self.kinds.values().any(|kind| kind.mode() == Mode::Durable)
     }
 
-    fn validate(&self) -> Result<(), ActorError> {
+    fn validate(
+        &self,
+        shard_claim: &Option<(String, Vec<usize>, Duration)>,
+    ) -> Result<(), ActorError> {
         if self.shards == 0
             || self.ingress_capacity == 0
             || self.mailbox_capacity == 0
@@ -190,8 +255,7 @@ impl ActorRuntimeBuilder {
         if self.standalone && self.shard_claim.is_some() {
             return Err(ActorError::InvalidConfiguration);
         }
-        if self
-            .shard_claim
+        if shard_claim
             .as_ref()
             .is_some_and(|(_, shards, lease)| shards.is_empty() || *lease < Duration::from_secs(1))
         {
@@ -203,13 +267,25 @@ impl ActorRuntimeBuilder {
         Ok(())
     }
 
-    fn spawn(self, ownership: Option<Ownership>) -> ActorRuntime {
-        let lease_supervisor = match (&self.shard_claim, &self.storage, &ownership) {
+    fn spawn(
+        self,
+        ownership: Option<Ownership>,
+        shard_claim: Option<(String, Vec<usize>, Duration)>,
+    ) -> ActorRuntime {
+        let lease_supervisor = match (&shard_claim, &self.storage, &ownership) {
             (Some((_, shards, lease)), Some(storage), Some(ownership)) => {
                 Some((storage.clone(), ownership.clone(), shards.clone(), *lease))
             }
             _ => None,
         };
+        let lease_release = lease_supervisor
+            .as_ref()
+            .map(|(storage, ownership, shards, lease)| LeaseRelease {
+                storage: storage.clone(),
+                ownership: ownership.clone(),
+                shards: shards.clone(),
+                timeout: (*lease / 3).min(MAX_LEASE_RELEASE_WAIT),
+            });
         let kinds = Arc::new(self.kinds);
         let mut senders = Vec::with_capacity(self.shards);
         let mut metrics = Vec::with_capacity(self.shards);
@@ -251,6 +327,7 @@ impl ActorRuntimeBuilder {
                 lease_stop: lease_stop.clone(),
                 #[cfg(feature = "experimental-rpc")]
                 lease_managed: lease_supervisor.is_some(),
+                lease_release,
                 metrics,
                 shutdown_status,
             }),
@@ -278,6 +355,14 @@ enum ShutdownStatus {
     Failed,
 }
 
+#[derive(Clone)]
+struct LeaseRelease {
+    storage: StorageBackend,
+    ownership: Ownership,
+    shards: Vec<usize>,
+    timeout: Duration,
+}
+
 struct RuntimeInner {
     senders: Vec<mpsc::Sender<Ingress>>,
     kinds: Arc<HashMap<&'static str, Arc<dyn ErasedKind>>>,
@@ -290,6 +375,7 @@ struct RuntimeInner {
     lease_stop: watch::Sender<bool>,
     #[cfg(feature = "experimental-rpc")]
     lease_managed: bool,
+    lease_release: Option<LeaseRelease>,
     metrics: Vec<Arc<ShardMetrics>>,
     shutdown_status: watch::Sender<ShutdownStatus>,
 }
@@ -376,6 +462,7 @@ impl ActorRuntime {
             let senders = self.inner.senders.clone();
             let state = self.inner.shutdown_status.clone();
             let lease_stop = self.inner.lease_stop.clone();
+            let lease_release = self.inner.lease_release.clone();
             state.send_replace(ShutdownStatus::Stopping);
             tokio::spawn(async move {
                 let result = async {
@@ -395,6 +482,17 @@ impl ActorRuntime {
                 }
                 .await;
                 lease_stop.send_replace(true);
+                if result.is_ok()
+                    && let Some(lease_release) = lease_release
+                {
+                    let _ = tokio::time::timeout(
+                        lease_release.timeout,
+                        lease_release
+                            .storage
+                            .release_selected(lease_release.ownership, lease_release.shards),
+                    )
+                    .await;
+                }
                 state.send_replace(if result.is_ok() {
                     ShutdownStatus::Stopped
                 } else {

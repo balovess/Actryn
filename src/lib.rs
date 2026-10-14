@@ -26,7 +26,7 @@ pub use runtime::{
 pub use storage::PostgresStorage;
 pub use storage::{
     CommitRequest, CommitResult, LOGICAL_SHARDS, Ownership, ShardLocation, SqliteStorage,
-    StorageAdapter, StorageBackend,
+    StorageAdapter, StorageBackend, balanced_initial_shards,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

@@ -32,6 +32,14 @@ impl StorageAdapter for CustomAdapter {
         Err(ActorError::InvalidConfiguration)
     }
 
+    async fn release_selected(
+        &self,
+        _ownership: Ownership,
+        _shards: Vec<usize>,
+    ) -> Result<(), ActorError> {
+        Err(ActorError::InvalidConfiguration)
+    }
+
     async fn locate(&self, _shard: usize) -> Result<Option<ShardLocation>, ActorError> {
         Ok(None)
     }

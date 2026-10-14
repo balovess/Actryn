@@ -7,6 +7,8 @@
 - Durable commands now expose explicit retry semantics for duplicate requests, conflicting request IDs, version conflicts, and ambiguous commit outcomes.
 - Runtimes that claim shards renew their leases automatically and fail closed when ownership can no longer be confirmed.
 - The experimental cluster client caches routes briefly and refreshes once after remote routing failures, while retaining the same command request ID and payload on retry.
+- Added deterministic balanced initial shard assignment for a fixed node membership list; membership changes still require application-managed migration.
+- Graceful shutdown attempts a fenced release of selected shard leases after draining accepted work; failed releases expire normally.
 - Storage-adapter checks cover lease renewal, including preserving the current owner and fencing epoch while extending lease expiry.
 - Added process-local runtime metrics and made concurrent shutdown callers share the same drain operation.
 - Added bounded benchmark examples for observing session throughput, latency, and resident actor memory. Results depend on the host and workload and are not performance guarantees.
