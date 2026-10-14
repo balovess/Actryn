@@ -74,7 +74,7 @@ async fn two_owners_remote_calls_and_fenced_failover() {
         .unwrap();
     let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr_b = listener_b.local_addr().unwrap().to_string();
-    let (_store_b, rt_b, client_b) = node(&path, "node-b", &addr_b, vec![1], lease);
+    let (store_b, rt_b, client_b) = node(&path, "node-b", &addr_b, vec![1], lease);
     let server_b = ClusterServerBuilder::new()
         .register::<Account>()
         .unwrap()
@@ -125,10 +125,9 @@ async fn two_owners_remote_calls_and_fenced_failover() {
         .unwrap();
     tokio::time::sleep(Duration::from_millis(800)).await;
     assert!(store_a.locate(0).await.unwrap().is_none());
-    assert!(matches!(
-        client_b.read::<Account>(&key_a).await,
-        Err(ActorError::NoOwner)
-    ));
+    // Keep client_b's cached route to node A through the ownership gap. Its next
+    // request should hit the stale endpoint, refresh placement, then reach node C.
+    assert!(store_b.locate(0).await.unwrap().is_none());
     // Replacement owner gets a strictly newer epoch and reloads persisted state.
     let listener_c = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr_c = listener_c.local_addr().unwrap().to_string();

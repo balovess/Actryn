@@ -1,19 +1,33 @@
 //! Single-host distributed *laboratory*: typed actor RPC + selective shard leases.
 //! SQLite is shared via a local filesystem; NOT a multi-host or secure network service.
 //! Request IDs are supplied by callers and must be reused across ambiguous timeouts.
-use crate::{ActorError, ActorRuntime, DurableActor, StorageBackend, storage::shard_for};
+use crate::{
+    ActorError, ActorRuntime, DurableActor, ShardLocation, StorageBackend, storage::shard_for,
+};
 use futures::{FutureExt, future::BoxFuture};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::{collections::HashMap, marker::PhantomData, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    marker::PhantomData,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::{Semaphore, oneshot},
+    sync::{RwLock, Semaphore, oneshot},
     task::JoinHandle,
 };
 
 const MAX_FRAME: usize = 1_048_576;
 const RPC_TIMEOUT: Duration = Duration::from_secs(10);
+const ROUTE_CACHE_TTL: Duration = Duration::from_secs(5);
+
+#[derive(Clone)]
+struct CachedRoute {
+    location: ShardLocation,
+    expires_at: Instant,
+}
 
 #[derive(Serialize, Deserialize)]
 enum Op {
@@ -89,13 +103,58 @@ async fn invoke(endpoint: &str, req: WireRequest) -> Result<Vec<u8>, ActorError>
         })?
 }
 
-/// Client-side API. First version deliberately queries placement for every call,
-/// so it cannot accidentally reuse an invalidated routing cache.
+async fn invoke_command<A: DurableActor>(
+    endpoint: &str,
+    key: &str,
+    request_id: &str,
+    payload: &[u8],
+) -> Result<A::Reply, ActorError> {
+    let bytes = invoke(
+        endpoint,
+        WireRequest {
+            op: Op::Command,
+            kind: A::KIND.into(),
+            key: key.into(),
+            request_id: request_id.into(),
+            payload: payload.to_vec(),
+        },
+    )
+    .await?;
+    serde_json::from_slice(&bytes).map_err(|e| ActorError::Codec(e.to_string()))
+}
+
+async fn invoke_read<A: DurableActor>(endpoint: &str, key: &str) -> Result<A::State, ActorError> {
+    let bytes = invoke(
+        endpoint,
+        WireRequest {
+            op: Op::Read,
+            kind: A::KIND.into(),
+            key: key.into(),
+            request_id: String::new(),
+            payload: Vec::new(),
+        },
+    )
+    .await?;
+    serde_json::from_slice(&bytes).map_err(|e| ActorError::Codec(e.to_string()))
+}
+
+fn should_refresh_route(error: &ActorError) -> bool {
+    matches!(
+        error,
+        ActorError::NoOwner
+            | ActorError::OwnershipLost
+            | ActorError::UnknownOutcome
+            | ActorError::ClusterProtocol(_)
+    )
+}
+
+/// Client-side API with a short-lived route cache and one refresh attempt after routing failures.
 #[derive(Clone)]
 pub struct ClusterClient {
     runtime: ActorRuntime,
     storage: StorageBackend,
     node_id: String,
+    routes: Arc<RwLock<HashMap<usize, CachedRoute>>>,
 }
 impl ClusterClient {
     pub fn new(
@@ -107,6 +166,56 @@ impl ClusterClient {
             runtime,
             storage: StorageBackend::new(storage),
             node_id: node_id.into(),
+            routes: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    async fn route_for(&self, shard: usize) -> Result<ShardLocation, ActorError> {
+        let now = Instant::now();
+        if let Some(route) = self
+            .routes
+            .read()
+            .await
+            .get(&shard)
+            .filter(|route| route.expires_at > now)
+        {
+            return Ok(route.location.clone());
+        }
+        self.refresh_route(shard).await
+    }
+
+    async fn refresh_route(&self, shard: usize) -> Result<ShardLocation, ActorError> {
+        let location = self.storage.locate(shard).await?;
+        let Some(location) = location else {
+            self.routes.write().await.remove(&shard);
+            return Err(ActorError::NoOwner);
+        };
+
+        let now = Instant::now();
+        let mut routes = self.routes.write().await;
+        if let Some(current) = routes
+            .get(&shard)
+            .filter(|current| current.expires_at > now && current.location.epoch > location.epoch)
+        {
+            return Ok(current.location.clone());
+        }
+        routes.insert(
+            shard,
+            CachedRoute {
+                location: location.clone(),
+                expires_at: now + ROUTE_CACHE_TTL,
+            },
+        );
+        Ok(location)
+    }
+
+    async fn invalidate_route(&self, shard: usize, observed: &ShardLocation) {
+        let mut routes = self.routes.write().await;
+        if routes
+            .get(&shard)
+            .is_some_and(|route| route.location == *observed)
+        {
+            routes.remove(&shard);
         }
     }
 
@@ -120,30 +229,44 @@ impl ClusterClient {
             return Err(ActorError::InvalidKey);
         }
         let shard = shard_for(A::KIND, key);
-        let placement = self
-            .storage
-            .locate(shard)
-            .await?
-            .ok_or(ActorError::NoOwner)?;
+        let placement = self.route_for(shard).await?;
         if placement.owner_id == self.node_id {
-            return self
+            let result = self
                 .runtime
                 .durable::<A>(key)
                 .command(request_id, cmd)
                 .await;
+            if result.as_ref().is_err_and(should_refresh_route) {
+                self.invalidate_route(shard, &placement).await;
+            }
+            return result;
         }
-        let bytes = invoke(
-            &placement.endpoint,
-            WireRequest {
-                op: Op::Command,
-                kind: A::KIND.into(),
-                key: key.into(),
-                request_id: request_id.into(),
-                payload: serde_json::to_vec(&cmd).map_err(|e| ActorError::Codec(e.to_string()))?,
-            },
-        )
-        .await?;
-        serde_json::from_slice(&bytes).map_err(|e| ActorError::Codec(e.to_string()))
+        let payload = serde_json::to_vec(&cmd).map_err(|e| ActorError::Codec(e.to_string()))?;
+        let result = invoke_command::<A>(&placement.endpoint, key, request_id, &payload).await;
+        let Err(error) = result else {
+            return result;
+        };
+        if !should_refresh_route(&error) {
+            return Err(error);
+        }
+
+        self.invalidate_route(shard, &placement).await;
+        let refreshed = match self.refresh_route(shard).await {
+            Ok(route) => route,
+            Err(_) => return Err(error),
+        };
+        let retry = if refreshed.owner_id == self.node_id {
+            self.runtime
+                .durable::<A>(key)
+                .command(request_id, cmd)
+                .await
+        } else {
+            invoke_command::<A>(&refreshed.endpoint, key, request_id, &payload).await
+        };
+        if retry.as_ref().is_err_and(should_refresh_route) {
+            self.invalidate_route(shard, &refreshed).await;
+        }
+        retry
     }
 
     pub async fn read<A: DurableActor>(&self, key: &str) -> Result<A::State, ActorError> {
@@ -151,26 +274,36 @@ impl ClusterClient {
             return Err(ActorError::InvalidKey);
         }
         let shard = shard_for(A::KIND, key);
-        let placement = self
-            .storage
-            .locate(shard)
-            .await?
-            .ok_or(ActorError::NoOwner)?;
+        let placement = self.route_for(shard).await?;
         if placement.owner_id == self.node_id {
-            return self.runtime.durable::<A>(key).read().await;
+            let result = self.runtime.durable::<A>(key).read().await;
+            if result.as_ref().is_err_and(should_refresh_route) {
+                self.invalidate_route(shard, &placement).await;
+            }
+            return result;
         }
-        let bytes = invoke(
-            &placement.endpoint,
-            WireRequest {
-                op: Op::Read,
-                kind: A::KIND.into(),
-                key: key.into(),
-                request_id: String::new(),
-                payload: Vec::new(),
-            },
-        )
-        .await?;
-        serde_json::from_slice(&bytes).map_err(|e| ActorError::Codec(e.to_string()))
+        let result = invoke_read::<A>(&placement.endpoint, key).await;
+        let Err(error) = result else {
+            return result;
+        };
+        if !should_refresh_route(&error) {
+            return Err(error);
+        }
+
+        self.invalidate_route(shard, &placement).await;
+        let refreshed = match self.refresh_route(shard).await {
+            Ok(route) => route,
+            Err(_) => return Err(error),
+        };
+        let retry = if refreshed.owner_id == self.node_id {
+            self.runtime.durable::<A>(key).read().await
+        } else {
+            invoke_read::<A>(&refreshed.endpoint, key).await
+        };
+        if retry.as_ref().is_err_and(should_refresh_route) {
+            self.invalidate_route(shard, &refreshed).await;
+        }
+        retry
     }
 }
 
@@ -329,9 +462,125 @@ impl Drop for ClusterServer {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClusterServerBuilder, TcpListener};
-    use crate::{ActorError, ActorRuntime, Decision, DurableActor, SqliteStorage};
+    use super::{ClusterClient, ClusterServerBuilder, Instant, TcpListener};
+    use crate::{
+        ActorError, ActorRuntime, CommitRequest, CommitResult, Decision, DurableActor,
+        OutboxRecord, OutboxStore, Ownership, ShardLocation, SqliteStorage, StorageAdapter,
+    };
+    use async_trait::async_trait;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     use std::time::Duration;
+    use tokio::sync::RwLock;
+
+    #[derive(Clone)]
+    struct RouteDirectory {
+        location: Arc<RwLock<Option<ShardLocation>>>,
+        locates: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl OutboxStore for RouteDirectory {
+        async fn pending_outbox(&self, _limit: usize) -> Result<Vec<OutboxRecord>, ActorError> {
+            Ok(Vec::new())
+        }
+
+        async fn ack_outbox(&self, _id: i64) -> Result<(), ActorError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl StorageAdapter for RouteDirectory {
+        async fn claim_selected(
+            &self,
+            _node_id: &str,
+            _endpoint: &str,
+            _shards: &[usize],
+            _lease: Duration,
+        ) -> Result<Ownership, ActorError> {
+            Err(ActorError::InvalidConfiguration)
+        }
+
+        async fn locate(&self, _shard: usize) -> Result<Option<ShardLocation>, ActorError> {
+            self.locates.fetch_add(1, Ordering::Relaxed);
+            Ok(self.location.read().await.clone())
+        }
+
+        async fn check_fence(
+            &self,
+            _ownership: Ownership,
+            _kind: &'static str,
+            _key: String,
+        ) -> Result<(), ActorError> {
+            Err(ActorError::InvalidConfiguration)
+        }
+
+        async fn load(
+            &self,
+            _ownership: Ownership,
+            _kind: &'static str,
+            _key: String,
+        ) -> Result<Option<(u64, Vec<u8>)>, ActorError> {
+            Err(ActorError::InvalidConfiguration)
+        }
+
+        async fn receipt(
+            &self,
+            _ownership: Ownership,
+            _kind: &'static str,
+            _key: String,
+            _request_id: String,
+        ) -> Result<Option<([u8; 32], Vec<u8>)>, ActorError> {
+            Err(ActorError::InvalidConfiguration)
+        }
+
+        async fn commit(&self, _request: CommitRequest) -> Result<CommitResult, ActorError> {
+            Err(ActorError::InvalidConfiguration)
+        }
+    }
+
+    fn location(owner_id: &str, epoch: u64) -> ShardLocation {
+        ShardLocation {
+            shard: 7,
+            owner_id: owner_id.to_owned(),
+            endpoint: format!("{owner_id}:9000"),
+            epoch,
+            expires_at_ms: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn route_cache_expires_and_old_failures_do_not_evict_newer_routes() {
+        let directory = RouteDirectory {
+            location: Arc::new(RwLock::new(Some(location("owner-a", 1)))),
+            locates: Arc::new(AtomicUsize::new(0)),
+        };
+        let runtime = ActorRuntime::builder().build().unwrap();
+        let client = ClusterClient::new(runtime.clone(), directory.clone(), "client");
+
+        let old_route = client.route_for(7).await.unwrap();
+        assert_eq!(client.route_for(7).await.unwrap(), old_route);
+        assert_eq!(directory.locates.load(Ordering::Relaxed), 1);
+
+        {
+            let mut routes = client.routes.write().await;
+            routes.get_mut(&7).unwrap().expires_at = Instant::now() - Duration::from_secs(1);
+        }
+        *directory.location.write().await = Some(location("owner-b", 2));
+
+        let new_route = client.route_for(7).await.unwrap();
+        assert_eq!(new_route.owner_id, "owner-b");
+        assert_eq!(directory.locates.load(Ordering::Relaxed), 2);
+
+        client.invalidate_route(7, &old_route).await;
+        assert_eq!(client.route_for(7).await.unwrap(), new_route);
+        assert_eq!(directory.locates.load(Ordering::Relaxed), 2);
+
+        runtime.shutdown().await.unwrap();
+    }
 
     struct LeaseProbe;
 

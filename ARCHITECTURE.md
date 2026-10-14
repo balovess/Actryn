@@ -42,6 +42,8 @@ Storage providers validate the current shard owner and fencing token before allo
 
 When an application explicitly assigns shards to a runtime, the runtime renews those leases. A renewal error or timeout causes that runtime to fail closed for durable work. Actryn does not select a replacement owner or move shards automatically.
 
+The experimental cluster client caches shard routes for up to five seconds. For remote calls, a routing or transport failure invalidates the observed route, looks up placement again, and retries once. If a locally handled call reports an ownership failure, the client drops that route and returns the error; the next call resolves placement again. The cache is only a routing hint: storage fencing remains the authority for reads and commits, and Actryn does not perform automatic failover.
+
 ## Metrics
 
 Runtime metrics are process-local observations and are not transactionally consistent across shards. Accepted-request counts describe mailbox admission, not successful execution. Rejected-request counts describe scheduler ingress rejection, not handler or storage failures. Metrics must not be used to make ownership or durability decisions.

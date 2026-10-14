@@ -37,6 +37,8 @@ Connecting a database driver does not make a provider safe for durable actors. P
 
 Runtimes that claim shards renew those leases automatically. Renewal attempts are bounded by the lease interval. A renewal error or timeout marks the runtime's ownership lost: new durable calls fail, and the experimental RPC server stops accepting requests. The runtime does not retry renewal or choose another owner. A provider may allow another runtime to claim the shards after the lease expires.
 
+The experimental cluster client caches shard placement for up to five seconds. For a remote call, a routing or transport failure invalidates the route it used, performs one fresh lookup, and retries at most once. A locally handled ownership failure evicts that route and returns the original error; the next call resolves placement again. Remote command retries preserve the original request ID and payload so an ambiguous commit remains idempotent. Cached placement is not proof of ownership; the provider's fencing checks remain authoritative.
+
 In-flight durable operations remain protected by the provider's fencing checks. During shutdown, lease renewal remains active while accepted work drains, then stops.
 
 ## Provider notes
