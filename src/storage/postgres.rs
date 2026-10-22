@@ -218,24 +218,37 @@ impl PostgresStorage {
         if shards.is_empty() || shards.iter().any(|s| *s >= LOGICAL_SHARDS) {
             return Err(ActorError::InvalidConfiguration);
         }
+        let mut unique_shards = shards;
+        unique_shards.sort_unstable();
+        unique_shards.dedup();
+        let shard_ids: Vec<i32> = unique_shards
+            .iter()
+            .map(|shard| i32::try_from(*shard).map_err(|_| ActorError::InvalidConfiguration))
+            .collect::<Result<_, _>>()?;
+        let epochs: Vec<i64> = unique_shards
+            .iter()
+            .map(|shard| as_i64(owner.epochs[*shard]))
+            .collect::<Result<_, _>>()?;
+
         let mut client = self.client().await?;
         let tx = client.transaction().await.map_err(db_error)?;
-        for shard in shards {
-            let shard_id = shard as i32;
-            let epoch = as_i64(owner.epochs[shard])?;
-            let updated = tx
-                .execute(
-                    "UPDATE shard_leases SET
-                    expires_at = clock_timestamp() + ($4::bigint * INTERVAL '1 millisecond')
-                 WHERE shard_id = $1 AND owner_id = $2 AND epoch = $3
-                   AND expires_at > clock_timestamp()",
-                    &[&shard_id, &owner.owner.as_ref(), &epoch, &ttl_ms],
-                )
-                .await
-                .map_err(db_error)?;
-            if updated != 1 {
-                return Err(ActorError::OwnershipLost);
-            }
+        // Renew the full set in one round trip so row locks are not held across
+        // sequential client/server exchanges for each shard.
+        let updated = tx
+            .execute(
+                "UPDATE shard_leases AS leases
+                 SET expires_at = clock_timestamp() + ($3::bigint * INTERVAL '1 millisecond')
+                 FROM unnest($1::integer[], $2::bigint[]) AS requested(shard_id, epoch)
+                 WHERE leases.shard_id = requested.shard_id
+                   AND leases.owner_id = $4
+                   AND leases.epoch = requested.epoch
+                   AND leases.expires_at > clock_timestamp()",
+                &[&shard_ids, &epochs, &ttl_ms, &owner.owner.as_ref()],
+            )
+            .await
+            .map_err(db_error)?;
+        if updated != unique_shards.len() as u64 {
+            return Err(ActorError::OwnershipLost);
         }
         tx.commit().await.map_err(db_error)?;
         Ok(())

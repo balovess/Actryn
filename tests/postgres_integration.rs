@@ -7,7 +7,10 @@ use std::time::Duration;
 
 mod common;
 
-use actryn::{ActorError, ActorRuntime, Decision, DurableActor, PostgresStorage};
+use actryn::{
+    ActorError, ActorRuntime, Decision, DurableActor, LOGICAL_SHARDS, PostgresStorage,
+    StorageAdapter,
+};
 use serde::{Deserialize, Serialize};
 
 struct Wallet;
@@ -137,4 +140,84 @@ async fn postgres_requires_explicit_shards() {
         .build_async()
         .await;
     assert!(matches!(result, Err(ActorError::InvalidConfiguration)));
+}
+
+#[tokio::test]
+async fn shard_lease_renewal_is_atomic_for_the_requested_set() {
+    let url = common::database_url();
+    let pool = common::pool(&url);
+    let storage = PostgresStorage::new(pool.clone());
+    storage.initialize_schema().await.unwrap();
+
+    let first_shard = common::unleased_shard(&storage).await;
+    let mut second_shard = None;
+    for shard in 0..LOGICAL_SHARDS {
+        if shard != first_shard
+            && storage
+                .locate(shard)
+                .await
+                .expect("read shard lease")
+                .is_none()
+        {
+            second_shard = Some(shard);
+            break;
+        }
+    }
+    let second_shard =
+        second_shard.expect("a second unleased shard is available in the dedicated test database");
+    let test_id = common::unique_id();
+    let node_a = format!("renew-node-a-{test_id}");
+    let node_b = format!("renew-node-b-{test_id}");
+    let lease = Duration::from_secs(30);
+    let owner = storage
+        .claim_selected(
+            &node_a,
+            "127.0.0.1:52003",
+            &[first_shard, second_shard],
+            lease,
+        )
+        .await
+        .unwrap();
+    let first_before = storage
+        .locate(first_shard)
+        .await
+        .unwrap()
+        .expect("first shard remains owned by node A");
+
+    let connection = pool.get().await.unwrap();
+    let second_id = i32::try_from(second_shard).unwrap();
+    connection
+        .execute(
+            "UPDATE shard_leases SET expires_at = clock_timestamp() - INTERVAL '1 second' WHERE shard_id = $1",
+            &[&second_id],
+        )
+        .await
+        .unwrap();
+    drop(connection);
+    storage
+        .claim_selected(&node_b, "127.0.0.1:52004", &[second_shard], lease)
+        .await
+        .unwrap();
+
+    let result = storage
+        .renew_selected(owner, vec![first_shard, second_shard], lease)
+        .await;
+    assert!(matches!(result, Err(ActorError::OwnershipLost)));
+    let first_after = storage
+        .locate(first_shard)
+        .await
+        .unwrap()
+        .expect("first shard remains owned by node A");
+    assert_eq!(first_before.owner_id, first_after.owner_id);
+    assert_eq!(first_before.epoch, first_after.epoch);
+    assert_eq!(first_before.expires_at_ms, first_after.expires_at_ms);
+    assert_eq!(
+        storage
+            .locate(second_shard)
+            .await
+            .unwrap()
+            .expect("second shard is owned by node B")
+            .owner_id,
+        node_b
+    );
 }

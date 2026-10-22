@@ -1,12 +1,8 @@
 # Actryn performance notes
 
-These measurements are exploratory baselines for one local machine. They help choose the next investigation; they are not service-level objectives, provider limits, or production guarantees. The timing recorder uses approximate logarithmic buckets, and the short actor-distribution runs have noisy p99 estimates.
+These exploratory measurements describe specific workloads on one local machine. They are not service-level objectives, provider limits, or production guarantees. Timing percentiles use approximate logarithmic buckets, and short actor-distribution runs have noisy p99 estimates.
 
-## Decision
-
-Keep the current scheduler architecture. The measurements do not justify a scheduler rewrite. Continue with repeatable fixed-arrival tests and use the optional timing observer to separate request latency from scheduler and PostgreSQL stages. The PostgreSQL p99 tail is not yet conclusively attributed to a single database phase. After the single-node persistence and recovery gates are reliable, move effort to automatic placement, failover, and multi-node testing rather than continued microbenchmark tuning.
-
-The 1,024-in-flight Little's Law estimate is a useful consistency check only when the measured mean number of in-flight requests is close to 1,024. `examples/benchmark.rs` now reports mean latency and `little_law_inflight~` (throughput multiplied by mean round-trip latency) for its closed-loop run. Compare that estimate with the configured concurrency before interpreting p99 as a scheduler property. Little's Law predicts a mean response time, not p99.
+For SessionActor workloads, configured concurrency is a cap rather than a measurement of average in-flight work. The benchmark reports a Little's Law estimate from throughput and mean round-trip latency; it predicts a mean response time, not p99.
 
 ## Measurement environment
 
@@ -17,7 +13,7 @@ The 1,024-in-flight Little's Law estimate is a useful consistency check only whe
 - Build: Cargo's default release profile; no project-specific `[profile.release]` overrides.
 - Durable runs used four physical scheduler shards and a PostgreSQL pool of 64 connections. Timing runs enabled the optional observer and therefore include instrumentation overhead.
 
-Record the exact command, commit, CPU load, toolchain, database configuration, actor distribution, payload sizes, warmup, and sample count with future results. Use a fresh disposable database for each comparison because outbox and actor rows remain in the database after a run.
+Use a fresh disposable database for each comparison because benchmark actor rows remain in the database after a run.
 
 ## SessionActor: closed-loop and fixed-arrival runs
 
@@ -36,7 +32,7 @@ The fixed-arrival sweep used the fresh 783,659 operations/s baseline, 1,000 acto
 
 Each measurement lasted five seconds after one-second preconditioning at each offered rate. There were no capacity rejections and completed throughput matched the target. Scheduler-queue p99 stayed below 7 µs, and runtime `ClientResponse` p99 ranged from about 10 to 37 µs. At 95%, driver lateness was about 49 µs p99 and scheduled-to-response p99 about 90 µs, so retain both values when comparing runs.
 
-The first five-second run used raw per-request vectors and a mutex in the producer to store driver lateness; at 95%, it reported about 3.97 ms driver-lag p99. Replacing those vectors with fixed-size histograms removed that per-arrival lock and unbounded sample storage. In the repeat, driver-lag p99 fell to about 49 µs and scheduled-to-response p99 to about 90 µs. This is strong evidence that the original measurement harness distorted the high-rate tail. The new histogram values are approximate upper bounds; keep the load generator itself under test as part of each performance run.
+An earlier five-second run reported about 3.97 ms driver-lag p99 at 95%; a later run measured about 49 µs driver-lag p99 and 90 µs scheduled-to-response p99. This discrepancy shows that load-generator behavior can materially affect high-rate tail measurements. The histogram values are approximate upper bounds, so interpret driver lateness separately from request latency.
 
 ## DurableActor: PostgreSQL stages and fixed-arrival sweep
 
@@ -71,7 +67,37 @@ A five-second repeat used a 3,213 commits/s saturation input, with one-second pr
 
 In this repeat, driver-lag p99 stayed below 0.2 µs and all requests completed at the offered rate. Scheduler queue p99 stayed below 41 µs, while the full storage operation p99 rose to 9–15 ms at 60–95%. Pool-acquire p99 was millisecond-scale in the 60% and 95% runs. These are independent histograms, so they do not prove which phase was slow for the same 19–38 ms request. Run-to-run tails were unstable: at the same 80% and 95% rates, earlier five-second runs measured end-to-end p99 around 30 ms, and the monitored repeat measured about 20 ms and 39 ms. Treat p50/p95 and stage trends as useful signals, but do not set a p99 regression threshold from these short runs.
 
-A separate repeat sampled `pg_stat_activity` every 200 ms while the benchmark ran. It observed `IO/WALWrite` in 52 samples and `LWLock/WALWrite` in 13, with peak active counts of 2 and 3 respectively. It observed no `Lock` wait event. `Client/ClientRead` appeared frequently, which represents pooled connections waiting for client input and is not evidence of a blocked transaction. WAL counters increased by about 41.6 MB and 380,669 records across setup, preconditioning, and measurement; `wal_buffers_full` did not increase. Checkpoint counters remained zero during the short run. The monitor itself adds a small query load, and this repeat's p99 varied from the unmonitored repeat, so treat WAL waits as a lead to investigate rather than a proven cause. Capture longer synchronized samples and compare WAL write/sync timing and pool acquisition under repeated runs before changing SQL or scheduler behavior.
+A separate five-second repeat sampled `pg_stat_activity` every 200 ms. It observed `IO/WALWrite` in 52 samples and `LWLock/WALWrite` in 13, with peak active counts of 2 and 3 respectively. It observed no `Lock` wait event. `Client/ClientRead` appeared frequently, which represents pooled connections waiting for client input and is not evidence of a blocked transaction. WAL counters increased by about 41.6 MB and 380,669 records across setup, preconditioning, and measurement; `wal_buffers_full` did not increase. Checkpoint counters remained zero during that run.
+
+A longer repeat used a fresh PostgreSQL instance, 100 actors, four physical shards, a 64-connection pool, `max_connections=100`, empty state and outbox payloads, and 20-second measurement windows after one-second preconditioning at each rate. The supplied saturation reference was 3,213 commits/s. Timing observations were enabled, but no `pg_stat_activity` polling ran during this measurement.
+
+| Offered rate | Target ops/s | End-to-end p50 | p95 | p99 | Storage-total p99 | Pool-acquire p99 | Scheduler-queue p99 | Failed |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 40% | 1,285 | ~3.93 ms | ~5.77 ms | ~20.97 ms | ~7.34 ms | ~4.61 µs | ~11.26 µs | 0 |
+| 60% | 1,927 | ~3.93 ms | ~6.29 ms | ~15.73 ms | ~7.86 ms | ~4.61 µs | ~14.34 µs | 0 |
+| 80% | 2,570 | ~5.24 ms | ~9.44 ms | ~46.14 ms | ~14.68 ms | ~4.19 ms | ~5.77 ms | 0 |
+| 95% | 3,052 | ~7.34 ms | ~14.68 ms | ~41.94 ms | ~15.73 ms | ~4.72 ms | ~7.34 ms | 0 |
+
+All offered requests were admitted and completed. The WAL counter increased by about 147.9 MB and 1.32 million records across schema setup, preconditioning, and measurement; `wal_buffers_full` did not increase. The stage percentiles are independent histograms and cannot be added to explain the same request's end-to-end latency. The 3,213 commits/s reference came from a shorter run and is host- and workload-specific, so these percentages are offered-load labels rather than verified fractions of sustained capacity.
+
+Three earlier 20-second sweeps sampled `pg_stat_activity` every 500 ms. Across them, 80% end-to-end p99 ranged from about 63 to 671 ms, and 95% p99 ranged from about 50 to 503 ms. One run showed 42 active sessions waiting on `Lock/transactionid`. A follow-up sample that included query text showed the durable fence read waiting on `SELECT owner_id, epoch FROM shard_leases WHERE shard_id = $1 FOR SHARE` while a lease renewal updating `shard_leases.expires_at` was active. In that 95% window, end-to-end and scheduler-queue p99 were both about 1.476 s; storage-total p99 was about 37.75 ms and pool-acquire p99 about 12.58 ms. All 61,040 offered requests completed. These observations make lease renewal a credible source of transaction lock contention, but sparse samples and independent histograms do not prove which individual requests waited on that lock.
+
+PostgreSQL lease renewal now updates the requested shard set with one statement. It checks the current owner, fencing epoch, and unexpired lease for every row, and commits only if every requested shard was updated; otherwise the transaction rolls back. This keeps set renewal atomic while removing the sequence of per-shard database round trips that previously extended the renewal transaction.
+
+Two 20-second repeats used the same offered rates, actor count, scheduler-shard count, pool size, and empty state/outbox payloads as the table above. The first ran without database polling. The second enabled PostgreSQL lock-wait logging with a 50 ms threshold and did not log any lock wait above that threshold.
+
+| Repeat | Offered rate | End-to-end p99 | Storage-total p99 | Pool-acquire p99 | Scheduler-queue p99 | Failed |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| A, unmonitored | 40% | ~7.34 ms | ~4.19 ms | ~4.61 µs | ~9.22 µs | 0 |
+| A, unmonitored | 60% | ~20.97 ms | ~9.44 ms | ~6.66 µs | ~16.38 µs | 0 |
+| A, unmonitored | 80% | ~402.65 ms | ~46.14 ms | ~14.68 ms | ~335.54 ms | 0 |
+| A, unmonitored | 95% | ~54.53 ms | ~18.87 ms | ~6.29 ms | ~20.97 ms | 0 |
+| B, lock logging | 40% | ~9.44 ms | ~4.72 ms | ~4.10 µs | ~8.19 µs | 0 |
+| B, lock logging | 60% | ~7.86 ms | ~4.72 ms | ~4.61 µs | ~11.26 µs | 0 |
+| B, lock logging | 80% | ~29.36 ms | ~13.63 ms | ~1.18 ms | ~26.62 µs | 0 |
+| B, lock logging | 95% | ~67.11 ms | ~20.97 ms | ~7.34 ms | ~31.46 ms | 0 |
+
+The long lock wait seen before the change did not recur in the lock-logged repeat. The unmonitored repeat still had a large 80% scheduler-queue outlier, while the second run did not; this run-to-run variance means the change has not established a general p99 improvement or explained every tail event. Continue measuring scheduler queue, pool acquisition, and storage phases separately under repeated fixed-arrival runs.
 
 ## DurableActor: actor distribution and write size
 
@@ -84,7 +110,7 @@ These single-run probes used 2,500 commands and concurrency 64. They are directi
 | 1,000 actors | 2,816/s | 15.2 ms | 20.4 ms | 464 ms | Scheduler-queue avg ~0.5 ms, p99 ~1.97 ms; storage-total p99 ~13.63 ms |
 | 100 actors, 1 KiB state, 2 effects × 32 B | 2,040/s | 20.24 ms | 53.0 ms | 448 ms | Scheduler-queue p99 ~125.8 ms; storage writes p99 ~10.49 ms; storage-total p99 ~18.87 ms |
 
-The hot-actor result matches the expected per-actor serialization queue. The multi-actor p99 outliers need longer samples and client-response/scheduler-completion timing before they can be assigned to a component. Repeat each distribution with tens of thousands of requests, then vary one dimension at a time: actor count, state bytes, outbox count, effect bytes, pool size, and offered rate.
+The hot-actor result is consistent with per-actor request serialization. The multi-actor p99 outliers do not identify a specific cause. These 2,500-command samples are directional rather than stable tail thresholds; compare repeated runs while changing one workload dimension at a time, such as actor count, state size, outbox count, effect size, pool size, or offered rate.
 
 ## Reproduction commands
 

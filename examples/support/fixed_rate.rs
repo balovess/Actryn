@@ -1,6 +1,7 @@
 use actryn::ActorError;
 use futures::Future;
 use std::{
+    collections::BTreeMap,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -22,6 +23,7 @@ pub struct FixedRateReport {
     duration: Duration,
     scheduled_to_response: LatencyHistogram,
     driver_lag: LatencyHistogram,
+    failure_kinds: BTreeMap<String, usize>,
 }
 
 impl FixedRateReport {
@@ -47,6 +49,15 @@ impl FixedRateReport {
             self.driver_lag.percentile(95),
             self.driver_lag.percentile(99),
         );
+        if !self.failure_kinds.is_empty() {
+            let summary = self
+                .failure_kinds
+                .iter()
+                .map(|(kind, count)| format!("{kind}:{count}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            println!("failure_kinds={summary}");
+        }
     }
 }
 
@@ -85,7 +96,7 @@ impl LatencyHistogram {
 }
 
 struct CompletionSample {
-    succeeded: bool,
+    failure_kind: Option<String>,
     scheduled_to_response: Duration,
 }
 
@@ -146,9 +157,9 @@ where
             let completed_tx = completed_tx.clone();
             let outstanding = producer_outstanding.clone();
             handle.spawn(async move {
-                let succeeded = issue(index).await.is_ok();
+                let failure_kind = issue(index).await.err().map(error_kind);
                 let sample = CompletionSample {
-                    succeeded,
+                    failure_kind,
                     scheduled_to_response: Instant::now().saturating_duration_since(scheduled),
                 };
                 let _ = completed_tx.send(sample).await;
@@ -170,15 +181,17 @@ where
         duration,
         scheduled_to_response: LatencyHistogram::default(),
         driver_lag: LatencyHistogram::default(),
+        failure_kinds: BTreeMap::new(),
     };
     while let Some(sample) = completed_rx.recv().await {
         report
             .scheduled_to_response
             .record(sample.scheduled_to_response);
-        if sample.succeeded {
-            report.completed += 1;
-        } else {
+        if let Some(kind) = sample.failure_kind {
             report.failed += 1;
+            *report.failure_kinds.entry(kind).or_default() += 1;
+        } else {
+            report.completed += 1;
         }
     }
     let producer = producer
@@ -189,6 +202,43 @@ where
     report.peak_inflight = producer.peak_inflight;
     report.driver_lag = producer.driver_lag;
     report
+}
+
+fn error_kind(error: ActorError) -> String {
+    match error {
+        ActorError::Rejected(_) => "rejected".into(),
+        ActorError::Storage(message) => storage_error_kind(&message),
+        ActorError::UnknownOutcome => "unknown_outcome".into(),
+        ActorError::Codec(_) => "codec".into(),
+        ActorError::RequestIdConflict => "request_id_conflict".into(),
+        ActorError::VersionConflict => "version_conflict".into(),
+        ActorError::OwnershipLost => "ownership_lost".into(),
+        ActorError::MailboxFull => "mailbox_full".into(),
+        ActorError::CapacityExceeded => "capacity_exceeded".into(),
+        ActorError::ShuttingDown => "shutting_down".into(),
+        ActorError::InvalidKey => "invalid_key".into(),
+        ActorError::UnregisteredKind => "unregistered_kind".into(),
+        ActorError::DuplicateKind => "duplicate_kind".into(),
+        ActorError::MissingStorage => "missing_storage".into(),
+        ActorError::InvalidConfiguration => "invalid_configuration".into(),
+        ActorError::TypeMismatch => "type_mismatch".into(),
+        ActorError::HandlerPanicked => "handler_panicked".into(),
+        ActorError::NoOwner => "no_owner".into(),
+        ActorError::ClusterProtocol(_) => "cluster_protocol".into(),
+    }
+}
+
+fn storage_error_kind(message: &str) -> String {
+    let Some((_, detail)) = message.split_once("PostgreSQL SQLSTATE ") else {
+        return "storage_other".into();
+    };
+    detail
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .find(|candidate| candidate.len() == 5)
+        .map_or_else(
+            || "storage_sqlstate_other".into(),
+            |code| format!("storage_sqlstate_{code}"),
+        )
 }
 
 fn try_reserve(outstanding: &AtomicUsize, limit: usize) -> Option<usize> {

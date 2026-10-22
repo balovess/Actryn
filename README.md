@@ -62,7 +62,7 @@ The release examples report workload-specific results; they are not performance 
 cargo run --release --example benchmark -- 1000 1000000 1024 4
 ```
 
-Then supply the measured operations-per-second ceiling to run a fixed-arrival sweep at 40%, 60%, 80%, and 95%. Latency starts at the planned arrival time, so generator delay is included; `driver_lag` is reported separately. The high-rate coordinator runs on a dedicated thread and busy-spins, consuming CPU; account for the load generator when interpreting results. Capacity rejections are reported separately, and latency percentiles cover admitted requests.
+Then supply the measured operations-per-second ceiling to run a fixed-arrival sweep at 40%, 60%, 80%, and 95%. Latency starts at the planned arrival time, so generator delay is included; `driver_lag` is reported separately. The high-rate coordinator runs on a dedicated thread and busy-spins, consuming CPU; account for the load generator when interpreting results. Capacity rejections are reported separately, failed requests are grouped by Actryn error category, and latency percentiles cover admitted requests.
 
 ```sh
 cargo run --release --example benchmark -- --open-loop 783659 5 1000 4 32768 --timings
