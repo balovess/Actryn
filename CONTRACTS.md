@@ -55,6 +55,8 @@ Outbox entries are durable delivery intents, not remote procedure calls. Deliver
 ## Runtime lifecycle and telemetry
 
 - Shutdown drains accepted work. Concurrent callers observe the same completion; cancelling a caller's wait does not cancel the drain.
+- Dropping the last runtime handle starts the same drain on a best-effort basis using the Tokio runtime that built it. Callers needing completion or lease-release evidence must call `shutdown()`.
+- An RPC timeout after a request may have reached the server is reported as `ActorError::UnknownOutcome`; a timeout before connection is a `ClusterProtocol` error.
 - A panic in an actor callback or state processing can discard that actor's current in-memory activation. This does not protect against process termination or side effects performed outside Actryn's durable commit.
 - Metrics are eventual process-local observations, not consistency or ownership primitives. Accepted requests count mailbox admission, not successful execution. Scheduler rejection counts do not include handler or storage failures.
 - The scheduler gives each ready actor one turn per visit. It does not preempt synchronous callbacks, which should remain short and bounded.

@@ -5,12 +5,14 @@
 - Added a provider-neutral storage API so applications can use compatible local or remote databases.
 - Added optional PostgreSQL storage with shared persistence and shard ownership fencing; SQLite remains intended for single-host use.
 - Durable commands now expose explicit retry semantics for duplicate requests, conflicting request IDs, version conflicts, and ambiguous commit outcomes.
+- Remote RPC timeouts after a request may have reached the server now report `UnknownOutcome`, while timeouts before connection remain protocol errors.
 - Runtimes that claim shards renew their leases automatically and fail closed when ownership can no longer be confirmed.
 - PostgreSQL renews a requested shard set in one atomic statement, preserving owner, fencing-epoch, and expiry checks for every shard.
 - The experimental cluster client caches routes briefly and refreshes once after remote routing failures, while retaining the same command request ID and payload on retry.
 - Added deterministic balanced initial shard assignment for a fixed node membership list; membership changes still require application-managed migration.
 - Added rendezvous-hash initial shard planning to limit movement across membership changes, with approximate shard balance and no automatic state migration.
 - Graceful shutdown attempts a fenced release of selected shard leases after draining accepted work; failed releases expire normally.
+- Dropping the last runtime handle starts a best-effort drain and lease release; `shutdown()` remains the way to observe completion.
 - Storage-adapter checks cover lease renewal, including preserving the current owner and fencing epoch while extending lease expiry.
 - Added process-local runtime metrics and made concurrent shutdown callers share the same drain operation.
 - Added bounded benchmark examples for observing session throughput, latency, and resident actor memory. Results depend on the host and workload and are not performance guarantees.

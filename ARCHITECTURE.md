@@ -31,6 +31,7 @@ SQLite provides single-host persistence. PostgreSQL is available as an optional 
 - **Session state is volatile.** It can be lost on passivation or process restart.
 - **Queues are bounded.** Overloaded actors or shards can reject new work rather than growing memory without limit.
 - **Shutdown drains accepted work.** Concurrent shutdown callers observe the same drain operation; cancelling a caller's wait does not cancel the drain.
+- **Dropping the last runtime handle starts a best-effort drain and lease release.** Callers that need completion evidence must still call `shutdown()`.
 
 ## Scheduling and callbacks
 
@@ -45,6 +46,8 @@ When an application explicitly assigns shards to a runtime, the runtime renews t
 For a fixed cluster membership, applications can choose between `balanced_initial_shards` / `claim_balanced_shards`, which distribute shards exactly evenly, and `rendezvous_initial_shards` / `claim_rendezvous_shards`, which reduce shard movement when membership changes at the cost of approximate balance. Every node must use the same member IDs. These planners do not discover members or transfer state; changing the member list requires an application-owned migration.
 
 The experimental cluster client caches shard routes for up to five seconds. For remote calls, a routing or transport failure invalidates the observed route, looks up placement again, and retries once. If a locally handled call reports an ownership failure, the client drops that route and returns the error; the next call resolves placement again. The cache is only a routing hint: storage fencing remains the authority for reads and commits, and Actryn does not perform automatic failover.
+
+A remote timeout after the request may have reached the server is reported as `ActorError::UnknownOutcome`. Callers retry with the same request ID and payload; a timeout before a connection is established remains a protocol error.
 
 ## Metrics
 

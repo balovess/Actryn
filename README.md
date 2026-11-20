@@ -17,6 +17,8 @@ An actor is identified by its kind and key, independently of the task handling a
 
 Durable commands use request IDs for deduplication. If a storage or transport failure leaves the outcome unclear, retry with the same request ID and payload. Outbox delivery is at-least-once, so consumers should deduplicate stable delivery IDs and make their own writes idempotent.
 
+`ActorRuntime::shutdown()` drains accepted work and is the deterministic way to observe completion. Dropping the last `ActorRuntime` handle also starts the same drain and lease release on a best-effort basis.
+
 ## Capabilities
 
 - Typed durable and session actor APIs with bounded mailboxes.

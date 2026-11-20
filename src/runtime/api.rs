@@ -386,6 +386,7 @@ impl ActorRuntimeBuilder {
                 senders,
                 kinds,
                 timing_observer: self.timing_observer,
+                runtime_handle: tokio::runtime::Handle::current(),
                 #[cfg(feature = "experimental-rpc")]
                 ownership,
                 stopping: AtomicBool::new(false),
@@ -435,6 +436,7 @@ struct RuntimeInner {
     senders: Vec<mpsc::Sender<Ingress>>,
     kinds: Arc<HashMap<&'static str, Arc<dyn ErasedKind>>>,
     timing_observer: Option<SharedTimingObserver>,
+    runtime_handle: tokio::runtime::Handle,
     stopping: AtomicBool,
     #[cfg(feature = "experimental-rpc")]
     ownership: Option<Ownership>,
@@ -449,6 +451,67 @@ struct RuntimeInner {
     shutdown_status: watch::Sender<ShutdownStatus>,
 }
 
+impl Drop for RuntimeInner {
+    fn drop(&mut self) {
+        if self.stopping.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let senders = self.senders.clone();
+        let state = self.shutdown_status.clone();
+        let lease_stop = self.lease_stop.clone();
+        let lease_release = self.lease_release.clone();
+        let handle = self.runtime_handle.clone();
+        state.send_replace(ShutdownStatus::Stopping);
+        drop(handle.spawn(drain(senders, lease_stop, lease_release, state)));
+    }
+}
+
+async fn drain(
+    senders: Vec<mpsc::Sender<Ingress>>,
+    lease_stop: watch::Sender<bool>,
+    lease_release: Option<LeaseRelease>,
+    state: watch::Sender<ShutdownStatus>,
+) {
+    let result = async {
+        let mut completions = Vec::with_capacity(senders.len());
+        for sender in &senders {
+            let (tx, rx) = oneshot::channel();
+            sender
+                .send(Ingress::Stop(tx))
+                .await
+                .map_err(|_| ActorError::ShuttingDown)?;
+            completions.push(rx);
+        }
+        for completion in completions {
+            completion.await.map_err(|_| ActorError::ShuttingDown)?;
+        }
+        Ok::<(), ActorError>(())
+    }
+    .await;
+    lease_stop.send_replace(true);
+    if result.is_ok()
+        && let Some(lease_release) = lease_release
+    {
+        let _ = tokio::time::timeout(
+            lease_release.timeout,
+            lease_release
+                .storage
+                .release_selected(lease_release.ownership, lease_release.shards),
+        )
+        .await;
+    }
+    state.send_replace(if result.is_ok() {
+        ShutdownStatus::Stopped
+    } else {
+        ShutdownStatus::Failed
+    });
+}
+
+/// Typed handles to the actor kinds registered on this runtime.
+///
+/// Clones share one shutdown. Dropping the last handle starts a best-effort
+/// drain and lease release on the Tokio runtime that built it; callers that
+/// need to observe completion must still call [`Self::shutdown`].
 #[derive(Clone)]
 pub struct ActorRuntime {
     inner: Arc<RuntimeInner>,
@@ -536,6 +599,8 @@ impl ActorRuntime {
     /// observe the *same completion*: neither may return early. If a caller's
     /// future is cancelled, a separately owned shutdown task keeps draining.
     /// After a fatal close failure all waiters receive `ShuttingDown`.
+    /// Dropping the last runtime handle also starts the drain, but only this
+    /// method reports when it has completed.
     pub async fn shutdown(&self) -> Result<(), ActorError> {
         let mut status = self.inner.shutdown_status.subscribe();
         if !self.inner.stopping.swap(true, Ordering::AcqRel) {
@@ -544,41 +609,7 @@ impl ActorRuntime {
             let lease_stop = self.inner.lease_stop.clone();
             let lease_release = self.inner.lease_release.clone();
             state.send_replace(ShutdownStatus::Stopping);
-            tokio::spawn(async move {
-                let result = async {
-                    let mut completions = Vec::with_capacity(senders.len());
-                    for sender in &senders {
-                        let (tx, rx) = oneshot::channel();
-                        sender
-                            .send(Ingress::Stop(tx))
-                            .await
-                            .map_err(|_| ActorError::ShuttingDown)?;
-                        completions.push(rx);
-                    }
-                    for completion in completions {
-                        completion.await.map_err(|_| ActorError::ShuttingDown)?;
-                    }
-                    Ok::<(), ActorError>(())
-                }
-                .await;
-                lease_stop.send_replace(true);
-                if result.is_ok()
-                    && let Some(lease_release) = lease_release
-                {
-                    let _ = tokio::time::timeout(
-                        lease_release.timeout,
-                        lease_release
-                            .storage
-                            .release_selected(lease_release.ownership, lease_release.shards),
-                    )
-                    .await;
-                }
-                state.send_replace(if result.is_ok() {
-                    ShutdownStatus::Stopped
-                } else {
-                    ShutdownStatus::Failed
-                });
-            });
+            tokio::spawn(drain(senders, lease_stop, lease_release, state));
         }
         loop {
             match *status.borrow_and_update() {

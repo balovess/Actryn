@@ -3,12 +3,16 @@
 //! Run against an isolated disposable database:
 //! ACTOR_TEST_DATABASE_URL=postgresql://... cargo test --features postgres --test postgres_integration
 
-use std::time::Duration;
+use std::{
+    future::pending,
+    process::{Child, Command, Stdio},
+    time::{Duration, Instant},
+};
 
 mod common;
 
 use actryn::{
-    ActorError, ActorRuntime, Decision, DurableActor, LOGICAL_SHARDS, PostgresStorage,
+    ActorError, ActorRuntime, Decision, DurableActor, LOGICAL_SHARDS, Ownership, PostgresStorage,
     StorageAdapter,
 };
 use serde::{Deserialize, Serialize};
@@ -22,6 +26,17 @@ struct Balance {
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Add(u64);
+
+struct KillOnDrop(Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if self.0.try_wait().ok().flatten().is_none() {
+            let _ = self.0.kill();
+        }
+        let _ = self.0.wait();
+    }
+}
 
 impl DurableActor for Wallet {
     const KIND: &'static str = "test.postgres.wallet.v1";
@@ -220,4 +235,175 @@ async fn shard_lease_renewal_is_atomic_for_the_requested_set() {
             .owner_id,
         node_b
     );
+}
+
+#[tokio::test]
+async fn postgres_process_crash_allows_fenced_stateful_takeover() {
+    let url = common::database_url();
+    let storage = PostgresStorage::new(common::pool(&url));
+    storage.initialize_schema().await.unwrap();
+
+    let shard = common::unleased_shard(&storage).await;
+    let key = common::key_on_shard(Wallet::KIND, shard);
+    let test_id = common::unique_id();
+    let node_a = format!("crash-owner-a-{test_id}");
+    let node_b = format!("crash-owner-b-{test_id}");
+    let lease = Duration::from_secs(3);
+    let directory = tempfile::tempdir().unwrap();
+    let ready_file = directory.path().join("owner-ready.txt");
+    let executable = std::env::current_exe().unwrap();
+    let mut child = KillOnDrop(
+        Command::new(executable)
+            .args([
+                "--ignored",
+                "--exact",
+                "postgres_crash_owner_child_process",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("ACTOR_TEST_DATABASE_URL", &url)
+            .env("ACTRYN_CRASH_CHILD_SHARD", shard.to_string())
+            .env("ACTRYN_CRASH_CHILD_KEY", &key)
+            .env("ACTRYN_CRASH_CHILD_NODE", &node_a)
+            .env("ACTRYN_CRASH_CHILD_LEASE_MS", lease.as_millis().to_string())
+            .env("ACTRYN_CRASH_CHILD_READY_FILE", &ready_file)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+
+    let ready_deadline = Instant::now() + Duration::from_secs(15);
+    while !ready_file.exists() {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            panic!("crash-owner process exited before acquiring its lease: {status}");
+        }
+        assert!(
+            Instant::now() < ready_deadline,
+            "crash-owner process did not become ready"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let snapshot = std::fs::read_to_string(&ready_file).unwrap();
+    let mut snapshot_lines = snapshot.lines();
+    let stale_owner_id = snapshot_lines.next().unwrap().to_owned();
+    let stale_epoch = snapshot_lines.next().unwrap().parse::<u64>().unwrap();
+    assert_eq!(stale_owner_id, node_a);
+    assert!(
+        child.0.try_wait().unwrap().is_none(),
+        "crash-owner process should remain alive while its runtime owns the lease"
+    );
+    let active_location = storage.locate(shard).await.unwrap().unwrap();
+    assert_eq!(active_location.owner_id, stale_owner_id);
+    assert_eq!(active_location.epoch, stale_epoch);
+
+    let premature_takeover = ActorRuntime::builder()
+        .storage(storage.clone())
+        .node_id(node_b.clone())
+        .claim_shards("127.0.0.1:52005", vec![shard], lease)
+        .register_durable::<Wallet>()
+        .unwrap()
+        .build_async()
+        .await;
+    assert!(matches!(premature_takeover, Err(ActorError::OwnershipLost)));
+    assert!(
+        child.0.try_wait().unwrap().is_none(),
+        "crash-owner process should still be alive before the forced crash"
+    );
+
+    child.0.kill().unwrap();
+    let crash_status = child.0.wait().unwrap();
+    assert!(
+        !crash_status.success(),
+        "the old owner must stop without running graceful shutdown"
+    );
+
+    let takeover_deadline = Instant::now() + lease + Duration::from_secs(5);
+    loop {
+        if storage.locate(shard).await.unwrap().is_none() {
+            break;
+        }
+        assert!(
+            Instant::now() < takeover_deadline,
+            "crashed owner's lease did not expire in time"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let runtime_b = ActorRuntime::builder()
+        .storage(storage.clone())
+        .node_id(node_b.clone())
+        .claim_shards("127.0.0.1:52005", vec![shard], lease)
+        .register_durable::<Wallet>()
+        .unwrap()
+        .build_async()
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime_b
+            .durable::<Wallet>(&key)
+            .command("after-process-crash", Add(2))
+            .await
+            .unwrap(),
+        7,
+        "the replacement owner continues from the state committed by the crashed process"
+    );
+
+    let mut stale_epochs = vec![0; LOGICAL_SHARDS];
+    stale_epochs[shard] = stale_epoch;
+    let stale_ownership = Ownership::new(stale_owner_id, stale_epochs).unwrap();
+    assert!(matches!(
+        storage.load(stale_ownership, Wallet::KIND, key).await,
+        Err(ActorError::OwnershipLost)
+    ));
+    runtime_b.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "subprocess fixture for postgres_process_crash_allows_fenced_stateful_takeover"]
+async fn postgres_crash_owner_child_process() {
+    let url = common::database_url();
+    let shard = std::env::var("ACTRYN_CRASH_CHILD_SHARD")
+        .unwrap()
+        .parse::<usize>()
+        .unwrap();
+    let key = std::env::var("ACTRYN_CRASH_CHILD_KEY").unwrap();
+    let node_id = std::env::var("ACTRYN_CRASH_CHILD_NODE").unwrap();
+    let lease = Duration::from_millis(
+        std::env::var("ACTRYN_CRASH_CHILD_LEASE_MS")
+            .unwrap()
+            .parse::<u64>()
+            .unwrap(),
+    );
+    let ready_file = std::env::var("ACTRYN_CRASH_CHILD_READY_FILE").unwrap();
+    let storage = PostgresStorage::new(common::pool(&url));
+    storage.initialize_schema().await.unwrap();
+    let runtime = ActorRuntime::builder()
+        .storage(storage.clone())
+        .node_id(node_id.clone())
+        .claim_shards("127.0.0.1:52004", vec![shard], lease)
+        .register_durable::<Wallet>()
+        .unwrap()
+        .build_async()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        runtime
+            .durable::<Wallet>(&key)
+            .command("before-process-crash", Add(5))
+            .await
+            .unwrap(),
+        5
+    );
+    let location = storage.locate(shard).await.unwrap().unwrap();
+    assert_eq!(location.owner_id, node_id);
+    std::fs::write(
+        ready_file,
+        format!("{}\n{}", location.owner_id, location.epoch),
+    )
+    .unwrap();
+
+    pending::<()>().await;
 }

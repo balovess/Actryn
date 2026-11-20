@@ -9,7 +9,10 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     collections::HashMap,
     marker::PhantomData,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::{
@@ -85,22 +88,37 @@ async fn read_frame(stream: &mut TcpStream) -> Result<Vec<u8>, ActorError> {
 }
 
 async fn invoke(endpoint: &str, req: WireRequest) -> Result<Vec<u8>, ActorError> {
+    invoke_with_timeout(endpoint, req, RPC_TIMEOUT).await
+}
+
+async fn invoke_with_timeout(
+    endpoint: &str,
+    req: WireRequest,
+    timeout: Duration,
+) -> Result<Vec<u8>, ActorError> {
     let encoded = serde_json::to_vec(&req).map_err(|e| ActorError::Codec(e.to_string()))?;
+    let request_in_flight = Arc::new(AtomicBool::new(false));
+    let marked = request_in_flight.clone();
     let exchange = async {
         let mut socket = TcpStream::connect(endpoint)
             .await
             .map_err(|e| ActorError::ClusterProtocol(e.to_string()))?;
+        // From here on a timeout may leave a complete request on the server,
+        // even if writing or flushing did not finish locally.
+        marked.store(true, Ordering::Release);
         write_frame(&mut socket, &encoded).await?;
         let reply = read_frame(&mut socket).await?;
         let response: WireResponse = serde_json::from_slice(&reply)
             .map_err(|e| ActorError::ClusterProtocol(e.to_string()))?;
         response.result
     };
-    tokio::time::timeout(RPC_TIMEOUT, exchange)
-        .await
-        .map_err(|_| {
-            ActorError::ClusterProtocol("RPC outcome unknown: retry same request ID".into())
-        })?
+    match tokio::time::timeout(timeout, exchange).await {
+        Ok(result) => result,
+        Err(_) if request_in_flight.load(Ordering::Acquire) => Err(ActorError::UnknownOutcome),
+        Err(_) => Err(ActorError::ClusterProtocol(
+            "RPC timed out before the request was sent".into(),
+        )),
+    }
 }
 
 async fn invoke_command<A: DurableActor>(
@@ -462,7 +480,10 @@ impl Drop for ClusterServer {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClusterClient, ClusterServerBuilder, Instant, TcpListener};
+    use super::{
+        ClusterClient, ClusterServerBuilder, Instant, Op, TcpListener, WireRequest,
+        invoke_with_timeout,
+    };
     use crate::{
         ActorError, ActorRuntime, CommitRequest, CommitResult, Decision, DurableActor,
         OutboxRecord, OutboxStore, Ownership, ShardLocation, SqliteStorage, StorageAdapter,
@@ -588,6 +609,29 @@ mod tests {
         assert_eq!(directory.locates.load(Ordering::Relaxed), 2);
 
         runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rpc_timeout_after_connect_reports_unknown_outcome() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let stalled_server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let request = WireRequest {
+            op: Op::Command,
+            kind: "test.kind.v1".into(),
+            key: "key".into(),
+            request_id: "request-1".into(),
+            payload: Vec::new(),
+        };
+        let result = invoke_with_timeout(&endpoint, request, Duration::from_millis(50)).await;
+        assert!(
+            matches!(result, Err(ActorError::UnknownOutcome)),
+            "unexpected result: {result:?}"
+        );
+        stalled_server.abort();
     }
 
     struct LeaseProbe;

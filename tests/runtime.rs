@@ -3,7 +3,7 @@ use actryn::{
     rendezvous_initial_shards,
 };
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 struct Wallet;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -480,4 +480,34 @@ async fn durable_sqlite_takeover_requires_explicit_opt_in() {
         .unwrap()
         .build();
     assert!(matches!(result, Err(ActorError::InvalidConfiguration)));
+}
+
+#[tokio::test]
+async fn dropping_last_runtime_handle_releases_selected_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = SqliteStorage::open(dir.path().join("drop-release.db")).unwrap();
+    let shard = 11;
+    let runtime = ActorRuntime::builder()
+        .storage(storage.clone())
+        .node_id("drop-owner")
+        .claim_shards("127.0.0.1:52008", vec![shard], Duration::from_secs(30))
+        .register_durable::<Wallet>()
+        .unwrap()
+        .build()
+        .unwrap();
+    assert!(storage.locate(shard).await.unwrap().is_some());
+
+    drop(runtime);
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if storage.locate(shard).await.unwrap().is_none() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the selected lease was not released after runtime drop"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }

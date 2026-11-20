@@ -33,7 +33,7 @@ pub use storage::{
 pub enum ActorError {
     Rejected(String),
     Storage(String),
-    /// The storage transaction may have committed, but its result was not received.
+    /// A storage commit or remote command may have taken effect, but its result was not received.
     /// Retry with the same request ID and payload; do not create a new request ID.
     UnknownOutcome,
     Codec(String),
