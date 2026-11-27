@@ -1,10 +1,14 @@
 [package]
 name = "actryn-test"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
+rust-version = "1.99"
 license = "AGPL-3.0-only"
 description = "Development-time contract tests for Actryn storage adapters"
 repository = "https://github.com/balovess/Actryn"
+
+[package.metadata.docs.rs]
+all-features = true
 
 [features]
 default = []
@@ -12,7 +16,7 @@ postgres = ["actryn/postgres", "dep:deadpool-postgres", "dep:tokio-postgres"]
 experimental-rpc = ["actryn/experimental-rpc"]
 
 [dependencies]
-actryn = { path = "..", version = "0.1.0" }
+actryn = { path = "..", version = "1.0.0" }
 async-trait = "0.1"
 deadpool-postgres = { version = "0.14", optional = true }
 tokio-postgres = { version = "0.7", optional = true }

@@ -15,12 +15,18 @@ pub(super) type Erased = Box<dyn Any + Send>;
 /// Transactional virtual object. `decide` must not mutate `state` through shared interior state.
 /// No `.await`: effects are durable intents committed with state (not executed inline).
 pub trait DurableActor: Send + Sync + 'static {
+    /// Globally unique actor kind used for registration and persistence.
     const KIND: &'static str;
+    /// Durable state type; serialized with serde before storage.
     type State: Clone + Serialize + DeserializeOwned + Send + 'static;
+    /// Command type accepted by [`Self::decide`].
     type Command: Serialize + Send + 'static;
+    /// Reply type returned after a successful commit or duplicate retry.
     type Reply: Serialize + DeserializeOwned + Send + 'static;
 
+    /// Creates initial state for a logical actor key with no stored state.
     fn initial(key: &str) -> Self::State;
+    /// Computes a candidate state transition without performing side effects.
     fn decide(
         state: &Self::State,
         command: Self::Command,
@@ -29,12 +35,18 @@ pub trait DurableActor: Send + Sync + 'static {
 /// In-memory virtual object. State is *not* durable; idle eviction or crashes reset it.
 /// A returned Reply may itself be a domain-specific Result type.
 pub trait SessionActor: Send + Sync + 'static {
+    /// Globally unique actor kind used for registration.
     const KIND: &'static str;
+    /// Volatile state type held in an activation slot.
     type State: Clone + Send + 'static;
+    /// Command type accepted by [`Self::handle`].
     type Command: Send + 'static;
+    /// Reply type returned to callers.
     type Reply: Send + 'static;
 
+    /// Creates initial state for a logical actor key.
     fn initial(key: &str) -> Self::State;
+    /// Applies one synchronous turn to the actor's in-memory state.
     fn handle(state: &mut Self::State, command: Self::Command) -> Self::Reply;
 }
 

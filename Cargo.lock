@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "actryn"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "deadpool-postgres",
@@ -20,7 +20,7 @@ dependencies = [
 
 [[package]]
 name = "actryn-test"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "actryn",
  "async-trait",

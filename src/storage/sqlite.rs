@@ -4,11 +4,11 @@ use super::{
     StorageBackend, shard_for,
 };
 use crate::{
-    ActorError,
+    ActorError, StorageError,
     outbox::{OutboxRecord, OutboxStore},
 };
 use async_trait::async_trait;
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use std::{
     path::Path,
     sync::{Arc, Mutex},
@@ -17,6 +17,7 @@ use std::{
 
 // Use the same database clock for lease acquisition, renewal and fencing.
 const DB_NOW: &str = "CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)";
+const SCHEMA_VERSION: u32 = 1;
 
 /// Embedded SQLite: safe for fencing tests on a *shared local filesystem*, not a
 /// multi-host database or multi-node placement implementation.
@@ -26,16 +27,29 @@ pub struct SqliteStorage {
 }
 
 fn db_err(e: rusqlite::Error) -> ActorError {
-    ActorError::Storage(e.to_string())
+    ActorError::Storage(StorageError::new("sqlite", "database", e))
 }
 fn join_err(e: tokio::task::JoinError) -> ActorError {
-    ActorError::Storage(e.to_string())
+    ActorError::Storage(StorageError::new("sqlite", "blocking_task", e))
+}
+fn lock_error() -> ActorError {
+    ActorError::Storage(StorageError::new(
+        "sqlite",
+        "connection_lock",
+        "poisoned mutex",
+    ))
 }
 fn as_i64(value: u64) -> Result<i64, ActorError> {
     i64::try_from(value).map_err(|_| ActorError::VersionConflict)
 }
 fn as_u64(value: i64) -> Result<u64, ActorError> {
-    u64::try_from(value).map_err(|_| ActorError::Storage("negative SQLite version or epoch".into()))
+    u64::try_from(value).map_err(|_| {
+        ActorError::Storage(StorageError::new(
+            "sqlite",
+            "integer_conversion",
+            "negative version or epoch",
+        ))
+    })
 }
 
 fn check_owner(
@@ -62,7 +76,55 @@ fn check_owner(
     }
 }
 
+fn upgrade_shard_owners(conn: &Connection) -> Result<(), ActorError> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(shard_owners)")
+        .map_err(db_err)?;
+    let names: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .map_err(db_err)?
+        .collect::<Result<_, _>>()
+        .map_err(db_err)?;
+    drop(stmt);
+    if !names.iter().any(|name| name == "endpoint") {
+        conn.execute_batch(
+            "ALTER TABLE shard_owners ADD COLUMN endpoint TEXT NOT NULL DEFAULT '';",
+        )
+        .map_err(db_err)?;
+    }
+    if !names.iter().any(|name| name == "expires_at_ms") {
+        conn.execute_batch(
+            "ALTER TABLE shard_owners ADD COLUMN expires_at_ms INTEGER NOT NULL DEFAULT 0;",
+        )
+        .map_err(db_err)?;
+    }
+    Ok(())
+}
+
+fn record_schema_version(tx: &Transaction<'_>) -> Result<(), ActorError> {
+    let current: i64 = tx
+        .query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM actryn_schema_migrations",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(db_err)?;
+    match current {
+        0 => {
+            tx.execute(
+                "INSERT INTO actryn_schema_migrations(version) VALUES (?1)",
+                params![i64::from(SCHEMA_VERSION)],
+            )
+            .map_err(db_err)?;
+            Ok(())
+        }
+        version if version == i64::from(SCHEMA_VERSION) => Ok(()),
+        _ => Err(ActorError::InvalidConfiguration),
+    }
+}
+
 impl SqliteStorage {
+    /// Opens or creates a SQLite database and applies infrastructure migrations.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ActorError> {
         let conn = Connection::open(path).map_err(db_err)?;
         conn.busy_timeout(Duration::from_secs(5)).map_err(db_err)?;
@@ -95,33 +157,49 @@ impl SqliteStorage {
                 payload BLOB NOT NULL, delivered INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(actor_kind,actor_key,request_id,ordinal)
              );
-             CREATE INDEX IF NOT EXISTS outbox_pending_idx ON outbox(delivered,id);",
+             CREATE INDEX IF NOT EXISTS outbox_pending_idx ON outbox(delivered,id);
+             CREATE TABLE IF NOT EXISTS actryn_schema_migrations (
+                version INTEGER PRIMARY KEY CHECK (version > 0),
+                applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+             );",
         )
         .map_err(db_err)?;
-        // Upgrade the v0.3 schema in place; existing claims expire, not states.
-        let mut stmt = conn
-            .prepare("PRAGMA table_info(shard_owners)")
-            .map_err(db_err)?;
-        let names: Vec<String> = stmt
-            .query_map([], |r| r.get::<_, String>(1))
-            .map_err(db_err)?
-            .collect::<Result<_, _>>()
-            .map_err(db_err)?;
-        drop(stmt);
-        if !names.iter().any(|n| n == "endpoint") {
-            conn.execute_batch(
-                "ALTER TABLE shard_owners ADD COLUMN endpoint TEXT NOT NULL DEFAULT '';",
-            )
-            .map_err(db_err)?;
-        }
-        if !names.iter().any(|n| n == "expires_at_ms") {
-            conn.execute_batch(
-                "ALTER TABLE shard_owners ADD COLUMN expires_at_ms INTEGER NOT NULL DEFAULT 0;",
-            )
-            .map_err(db_err)?;
-        }
-        Ok(Self {
+        let storage = Self {
             connection: Arc::new(Mutex::new(conn)),
+        };
+        storage.migrate()?;
+        Ok(storage)
+    }
+
+    /// Applies bundled infrastructure schema migrations and records the result.
+    ///
+    /// This does not migrate application-owned actor state payloads.
+    pub fn migrate(&self) -> Result<(), ActorError> {
+        let mut conn = self.connection.lock().map_err(|_| lock_error())?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_err)?;
+        upgrade_shard_owners(&tx)?;
+        record_schema_version(&tx)?;
+        tx.commit().map_err(db_err)
+    }
+
+    /// Returns the applied infrastructure schema version, or zero before migration.
+    pub fn schema_version(&self) -> Result<u32, ActorError> {
+        let conn = self.connection.lock().map_err(|_| lock_error())?;
+        let version: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM actryn_schema_migrations",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(db_err)?;
+        u32::try_from(version).map_err(|_| {
+            ActorError::Storage(StorageError::new(
+                "sqlite",
+                "schema_version",
+                "schema version exceeds supported range",
+            ))
         })
     }
 
@@ -132,10 +210,7 @@ impl SqliteStorage {
         if node_id.is_empty() || node_id.len() > 256 {
             return Err(ActorError::InvalidKey);
         }
-        let mut conn = self
-            .connection
-            .lock()
-            .map_err(|_| ActorError::Storage("poisoned mutex".into()))?;
+        let mut conn = self.connection.lock().map_err(|_| lock_error())?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(db_err)?;
@@ -192,10 +267,7 @@ impl SqliteStorage {
         let mut unique = shards.to_vec();
         unique.sort_unstable();
         unique.dedup();
-        let mut conn = self
-            .connection
-            .lock()
-            .map_err(|_| ActorError::Storage("poisoned mutex".into()))?;
+        let mut conn = self.connection.lock().map_err(|_| lock_error())?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(db_err)?;
@@ -250,9 +322,7 @@ impl SqliteStorage {
             return Err(ActorError::InvalidConfiguration);
         }
         tokio::task::spawn_blocking(move || {
-            let mut conn = connection
-                .lock()
-                .map_err(|_| ActorError::Storage("poisoned mutex".into()))?;
+            let mut conn = connection.lock().map_err(|_| lock_error())?;
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(db_err)?;
@@ -298,9 +368,7 @@ impl SqliteStorage {
             unique.sort_unstable();
             unique.dedup();
 
-            let mut conn = connection
-                .lock()
-                .map_err(|_| ActorError::Storage("poisoned mutex".into()))?;
+            let mut conn = connection.lock().map_err(|_| lock_error())?;
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(db_err)?;
@@ -324,15 +392,14 @@ impl SqliteStorage {
         .map_err(join_err)?
     }
 
+    /// Looks up the unexpired owner of one logical shard using database time.
     pub async fn locate(&self, shard: usize) -> Result<Option<ShardLocation>, ActorError> {
         if shard >= LOGICAL_SHARDS {
             return Err(ActorError::InvalidConfiguration);
         }
         let connection = self.connection.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = connection
-                .lock()
-                .map_err(|_| ActorError::Storage("poisoned mutex".into()))?;
+            let conn = connection.lock().map_err(|_| lock_error())?;
             let sql = format!(
                 "SELECT owner_id,endpoint,epoch,expires_at_ms FROM shard_owners
                  WHERE shard_id=?1 AND expires_at_ms > ({DB_NOW})"
@@ -364,6 +431,7 @@ impl SqliteStorage {
         .map_err(join_err)?
     }
 
+    /// Returns the stable logical shard for an actor kind and key.
     pub fn shard_for(kind: &str, key: &str) -> usize {
         shard_for(kind, key)
     }
@@ -376,9 +444,7 @@ impl SqliteStorage {
     ) -> Result<(), ActorError> {
         let conn = self.connection.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = conn
-                .lock()
-                .map_err(|_| ActorError::Storage("poisoned mutex".into()))?;
+            let conn = conn.lock().map_err(|_| lock_error())?;
             check_owner(&conn, &owner, kind, &key)
         })
         .await
@@ -393,9 +459,7 @@ impl SqliteStorage {
     ) -> Result<Option<(u64, Vec<u8>)>, ActorError> {
         let conn = self.connection.clone();
         tokio::task::spawn_blocking(move || {
-            let mut conn = conn
-                .lock()
-                .map_err(|_| ActorError::Storage("poisoned mutex".into()))?;
+            let mut conn = conn.lock().map_err(|_| lock_error())?;
             // Read transaction gives one SQLite snapshot for owner check + state load.
             let tx = conn.transaction().map_err(db_err)?;
             check_owner(&tx, &owner, kind, &key)?;
@@ -424,9 +488,7 @@ impl SqliteStorage {
     ) -> Result<Option<([u8; 32], Vec<u8>)>, ActorError> {
         let conn = self.connection.clone();
         tokio::task::spawn_blocking(move || {
-            let mut conn = conn
-                .lock()
-                .map_err(|_| ActorError::Storage("poisoned mutex".into()))?;
+            let mut conn = conn.lock().map_err(|_| lock_error())?;
             let tx = conn.transaction().map_err(db_err)?;
             check_owner(&tx, &owner, kind, &key)?;
             let found: Option<(Vec<u8>, Vec<u8>)> = tx
@@ -440,9 +502,13 @@ impl SqliteStorage {
                 .map_err(db_err)?;
             found
                 .map(|(hash, reply)| {
-                    let hash: [u8; 32] = hash
-                        .try_into()
-                        .map_err(|_| ActorError::Storage("invalid stored hash".into()))?;
+                    let hash: [u8; 32] = hash.try_into().map_err(|_| {
+                        ActorError::Storage(StorageError::new(
+                            "sqlite",
+                            "receipt",
+                            "invalid stored hash",
+                        ))
+                    })?;
                     Ok((hash, reply))
                 })
                 .transpose()
@@ -465,9 +531,7 @@ impl SqliteStorage {
                 reply,
                 effects,
             } = request;
-            let mut conn = conn
-                .lock()
-                .map_err(|_| ActorError::Storage("poisoned mutex".into()))?;
+            let mut conn = conn.lock().map_err(|_| lock_error())?;
             // Claim/handover and commit both use BEGIN IMMEDIATE: fencing cannot
             // race between ownership verification and state/outbox write.
             let tx = conn
@@ -501,9 +565,13 @@ impl SqliteStorage {
             if prior.unwrap_or(0) != expected_version {
                 return Ok(CommitResult::VersionConflict);
             }
-            let version = expected_version
-                .checked_add(1)
-                .ok_or_else(|| ActorError::Storage("state version overflow".into()))?;
+            let version = expected_version.checked_add(1).ok_or_else(|| {
+                ActorError::Storage(StorageError::new(
+                    "sqlite",
+                    "commit",
+                    "state version overflow",
+                ))
+            })?;
             let expected_version = as_i64(expected_version)?;
             let version = as_i64(version)?;
             let rows = if prior.is_none() {
@@ -561,9 +629,7 @@ impl SqliteStorage {
         }
         let conn = self.connection.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = conn
-                .lock()
-                .map_err(|_| ActorError::Storage("poisoned mutex".into()))?;
+            let conn = conn.lock().map_err(|_| lock_error())?;
             let mut stmt = conn
                 .prepare(
                     "SELECT id,actor_kind,actor_key,request_id,ordinal,
@@ -591,12 +657,11 @@ impl SqliteStorage {
         .map_err(join_err)?
     }
 
+    /// Persistently marks one outbox record as delivered.
     pub async fn ack_outbox(&self, id: i64) -> Result<(), ActorError> {
         let conn = self.connection.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = conn
-                .lock()
-                .map_err(|_| ActorError::Storage("poisoned mutex".into()))?;
+            let conn = conn.lock().map_err(|_| lock_error())?;
             conn.execute("UPDATE outbox SET delivered=1 WHERE id=?1", params![id])
                 .map_err(db_err)?;
             Ok(())
@@ -716,6 +781,31 @@ mod adapter_tests {
         let storage = SqliteStorage::open(":memory:").expect("open sqlite");
         let backend = StorageBackend::new(storage);
         assert!(backend.claim_all_local("test").is_ok());
+    }
+
+    #[test]
+    fn sqlite_schema_version_is_recorded_and_migration_is_idempotent() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = directory.path().join("schema.db");
+        let storage = SqliteStorage::open(&path).expect("open sqlite");
+        assert_eq!(storage.schema_version().unwrap(), SCHEMA_VERSION);
+        storage.migrate().unwrap();
+        assert_eq!(storage.schema_version().unwrap(), SCHEMA_VERSION);
+
+        drop(storage);
+        let reopened = SqliteStorage::open(&path).expect("reopen sqlite");
+        assert_eq!(reopened.schema_version().unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn sqlite_errors_have_explicit_provider_and_operation() {
+        match lock_error() {
+            ActorError::Storage(detail) => {
+                assert_eq!(detail.provider, "sqlite");
+                assert_eq!(detail.operation, "connection_lock");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 }
 

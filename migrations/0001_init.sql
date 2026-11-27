@@ -1,4 +1,9 @@
--- Development bootstrap; production should use an explicit migration runner.
+-- Initial Actryn infrastructure schema. Applied by PostgresStorage::migrate().
+CREATE TABLE IF NOT EXISTS actryn_schema_migrations (
+    version bigint PRIMARY KEY CHECK (version > 0),
+    applied_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
 CREATE TABLE IF NOT EXISTS shard_leases (
     shard_id integer PRIMARY KEY CHECK (shard_id >= 0 AND shard_id < 256),
     owner_id text NOT NULL,

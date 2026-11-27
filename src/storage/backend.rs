@@ -81,6 +81,7 @@ impl StorageBackend {
         self.adapter.release_selected(ownership, shards).await
     }
 
+    /// Looks up the unexpired owner of one logical shard.
     pub async fn locate(&self, shard: usize) -> Result<Option<ShardLocation>, ActorError> {
         self.adapter.locate(shard).await
     }

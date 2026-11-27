@@ -24,6 +24,10 @@ A provider may use an embedded or remote database. It may support durable actors
 
 Connecting a database driver does not make a provider safe for durable actors. Providers must uphold the transaction, isolation, and fencing guarantees above and document any limitations.
 
+The runtime consumes only [`StorageAdapter`] and [`OutboxStore`]. Applications may inject a concrete adapter with `ActorRuntimeBuilder::storage()` or a trait object with `ActorRuntimeBuilder::storage_shared()`. Runtime code contains no provider-specific database branches.
+
+Bundled adapters persist an infrastructure schema version. SQLite records it during `open()`; PostgreSQL exposes `migrate()` and `schema_version()` and serializes migration attempts with a database advisory lock. Future schema versions greater than an adapter supports are rejected with `InvalidConfiguration` rather than partially applied. Application-owned actor state payloads are outside this mechanism.
+
 ## Commit results and retries
 
 - An applied result means state, receipt, and effects committed together.
@@ -33,6 +37,7 @@ Connecting a database driver does not make a provider safe for durable actors. P
 - An ownership failure means the fencing token is missing, stale, or expired.
 - An unknown outcome means the provider may have committed but could not return a definitive result. Retry the same request ID and payload.
 - A storage error should indicate a known failure. If the provider cannot determine whether commit succeeded, it must report an unknown outcome instead.
+- Known storage failures are reported as `ActorError::Storage(StorageError)` with an explicit provider, operation, optional provider code, and retryability. `UnknownOutcome` is never encoded as a known storage failure.
 
 ## Lease ownership
 
@@ -57,6 +62,7 @@ Outbox entries are durable delivery intents, not remote procedure calls. Deliver
 - Shutdown drains accepted work. Concurrent callers observe the same completion; cancelling a caller's wait does not cancel the drain.
 - Dropping the last runtime handle starts the same drain on a best-effort basis using the Tokio runtime that built it. Callers needing completion or lease-release evidence must call `shutdown()`.
 - An RPC timeout after a request may have reached the server is reported as `ActorError::UnknownOutcome`; a timeout before connection is a `ClusterProtocol` error.
+- `ActorRuntime::ownership_lost()` reports the runtime's fail-closed lease state for process-local health checks. Storage fencing remains the authority for ownership decisions.
 - A panic in an actor callback or state processing can discard that actor's current in-memory activation. This does not protect against process termination or side effects performed outside Actryn's durable commit.
 - Metrics are eventual process-local observations, not consistency or ownership primitives. Accepted requests count mailbox admission, not successful execution. Scheduler rejection counts do not include handler or storage failures.
 - The scheduler gives each ready actor one turn per visit. It does not preempt synchronous callbacks, which should remain short and bounded.
@@ -65,5 +71,5 @@ Outbox entries are durable delivery intents, not remote procedure calls. Deliver
 
 - Actryn does not provide consensus, membership discovery, automatic failover, dynamic shard placement, or rebalance. `balanced_initial_shards` creates an exactly balanced deterministic assignment for a fixed node list; `rendezvous_initial_shards` minimizes movement as membership changes with approximate balance. Both plan initial ownership only and do not migrate actor state.
 - The experimental RPC transport is loopback-only and has no authentication or TLS. Do not expose it to untrusted networks.
-- Durable state has no built-in schema-version migration mechanism. Applications must keep persisted data compatible with the versions that read it.
+- Application-owned durable state payloads have no built-in schema-version migration mechanism. Applications must keep persisted data compatible with the versions that read it.
 - Keep actor-to-shard placement stable across application versions unless you have an application-owned migration plan. Actryn does not migrate stored state or ownership automatically.

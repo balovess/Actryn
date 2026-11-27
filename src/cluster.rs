@@ -175,6 +175,7 @@ pub struct ClusterClient {
     routes: Arc<RwLock<HashMap<usize, CachedRoute>>>,
 }
 impl ClusterClient {
+    /// Creates a client that can serve local shards and proxy remote shards.
     pub fn new(
         runtime: ActorRuntime,
         storage: impl crate::storage::StorageAdapter,
@@ -237,6 +238,7 @@ impl ClusterClient {
         }
     }
 
+    /// Sends one durable command, refreshing a failed route at most once.
     pub async fn command<A: DurableActor>(
         &self,
         key: &str,
@@ -287,6 +289,7 @@ impl ClusterClient {
         retry
     }
 
+    /// Reads one durable actor state, refreshing a failed route at most once.
     pub async fn read<A: DurableActor>(&self, key: &str) -> Result<A::State, ActorError> {
         if key.is_empty() || key.len() > 256 {
             return Err(ActorError::InvalidKey);
@@ -364,15 +367,18 @@ where
     }
 }
 
+/// Registers durable actor handlers for the experimental loopback server.
 pub struct ClusterServerBuilder {
     handlers: HashMap<String, Arc<dyn RemoteHandler>>,
 }
 impl ClusterServerBuilder {
+    /// Creates an empty handler registry.
     pub fn new() -> Self {
         Self {
             handlers: HashMap::new(),
         }
     }
+    /// Registers one durable actor kind for remote command and read handling.
     pub fn register<A>(mut self) -> Result<Self, ActorError>
     where
         A: DurableActor,
@@ -460,11 +466,13 @@ impl Default for ClusterServerBuilder {
     }
 }
 
+/// Running experimental loopback RPC listener.
 pub struct ClusterServer {
     stop: Option<oneshot::Sender<()>>,
     task: JoinHandle<()>,
 }
 impl ClusterServer {
+    /// Stops accepting requests and waits for the listener task to finish.
     pub async fn shutdown(mut self) {
         if let Some(sender) = self.stop.take() {
             let _ = sender.send(());

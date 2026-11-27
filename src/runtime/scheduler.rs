@@ -1,12 +1,18 @@
 //! Per-shard run-to-completion turn scheduler.
 //! A slot is an activation, not a task; I/O completions drive state transitions.
+//!
+//! Internal `expect` and `unreachable!` calls in this module encode invariants
+//! established before spawn: durable storage and ownership are validated by the
+//! builder, typed commands are decoded by their registered kind, and slot phase
+//! transitions are owned by this state machine. User-controlled failures are
+//! returned as [`crate::ActorError`] instead of panicking.
 use super::{
     actor::{Erased, ErasedKind, Executed, Mode},
     metrics::ShardMetrics,
     timing::{SharedTimingObserver, TimingStage},
 };
 use crate::{
-    ActorError,
+    ActorError, StorageError,
     storage::{CommitRequest, CommitResult, Ownership, StorageBackend},
 };
 use futures::{
@@ -557,9 +563,11 @@ impl Shard {
                         } else {
                             self.fail_slot(
                                 &id,
-                                ActorError::Storage(
-                                    "commit outcome unresolved: retry with same request ID".into(),
-                                ),
+                                ActorError::Storage(StorageError::new(
+                                    "runtime",
+                                    "commit",
+                                    "commit outcome unresolved: retry with same request ID",
+                                )),
                             );
                         }
                     }

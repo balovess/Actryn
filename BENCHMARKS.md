@@ -1,6 +1,6 @@
 # Performance Baseline
 
-This is a local baseline for the Actryn v0.1.0 candidate. It is a reproducible datapoint for this host, not a release threshold or a comparison against another actor framework.
+This local baseline was recorded for the Actryn v0.1.0 candidate. It remains a reproducible datapoint for that host, not a release threshold or a comparison against another actor framework.
 
 ## Environment
 

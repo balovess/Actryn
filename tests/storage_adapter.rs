@@ -1,5 +1,5 @@
 //! Public extension-point compile test for application-defined storage providers.
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use actryn::{
     ActorError, ActorRuntime, CommitRequest, CommitResult, OutboxRecord, OutboxStore, Ownership,
@@ -80,4 +80,10 @@ impl StorageAdapter for CustomAdapter {
 #[test]
 fn builder_accepts_an_application_defined_storage_adapter() {
     let _builder = ActorRuntime::builder().storage(CustomAdapter);
+}
+
+#[test]
+fn builder_accepts_a_shared_storage_adapter_trait_object() {
+    let adapter: Arc<dyn StorageAdapter> = Arc::new(CustomAdapter);
+    let _builder = ActorRuntime::builder().storage_shared(adapter);
 }

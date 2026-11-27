@@ -6,14 +6,23 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 /// consistent view across shards. `live_activations` counts resident slots.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RuntimeMetrics {
+    /// Requests admitted to actor mailboxes.
     pub accepted_requests: u64,
+    /// Requests rejected at scheduler ingress.
     pub rejected_requests: u64,
+    /// Commands whose actor callback executed.
     pub commands_executed: u64,
+    /// Durable commands confirmed as applied by storage.
     pub durable_commits: u64,
+    /// Duplicate request replies returned to callers.
     pub duplicate_replies: u64,
+    /// User callbacks that panicked and discarded their activation.
     pub handler_panics: u64,
+    /// Actor activations created since runtime start.
     pub activations_created: u64,
+    /// Actor activations removed by eviction or failure.
     pub activations_evicted: u64,
+    /// Activations currently resident on all shards.
     pub live_activations: usize,
 }
 

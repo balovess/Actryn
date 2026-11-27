@@ -1,5 +1,7 @@
 //! Development-time checks for implementations of Actryn's storage contract.
+#![deny(missing_docs)]
 
+/// Fault-injection decorators for development-time storage tests.
 pub mod faults {
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -21,6 +23,7 @@ pub mod faults {
     }
 
     impl<A> LoseNextCommitResponse<A> {
+        /// Wraps an adapter and arms one lost-response fault.
         pub fn new(inner: A) -> Self {
             Self {
                 inner,
@@ -28,10 +31,12 @@ pub mod faults {
             }
         }
 
+        /// Borrows the wrapped adapter.
         pub fn inner(&self) -> &A {
             &self.inner
         }
 
+        /// Returns the wrapped adapter, discarding any armed fault.
         pub fn into_inner(self) -> A {
             self.inner
         }
@@ -141,6 +146,7 @@ pub mod faults {
     }
 }
 
+/// Reusable conformance checks for Actryn storage adapters.
 pub mod storage {
     use std::{
         fmt,
@@ -158,7 +164,9 @@ pub mod storage {
     pub enum ContractError {
         /// The adapter could not complete the named operation.
         Adapter {
+            /// Name of the adapter operation that failed.
             operation: &'static str,
+            /// Error returned by the adapter.
             source: ActorError,
         },
         /// The adapter returned a result that violates the durable storage contract.

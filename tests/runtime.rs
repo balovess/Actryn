@@ -511,3 +511,34 @@ async fn dropping_last_runtime_handle_releases_selected_lease() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
+
+#[tokio::test]
+async fn ownership_loss_is_observable_before_shutdown() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ownership-health.db");
+    let storage = SqliteStorage::open(&path).unwrap();
+    let runtime = ActorRuntime::builder()
+        .storage(storage)
+        .node_id("health-owner")
+        .claim_shards("127.0.0.1:52009", vec![0], Duration::from_secs(1))
+        .register_durable::<Wallet>()
+        .unwrap()
+        .build()
+        .unwrap();
+    assert!(!runtime.ownership_lost());
+
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE shard_owners SET expires_at_ms=0 WHERE shard_id=0",
+            [],
+        )
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !runtime.ownership_lost() {
+        assert!(Instant::now() < deadline, "ownership loss was not observed");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    runtime.shutdown().await.unwrap();
+}

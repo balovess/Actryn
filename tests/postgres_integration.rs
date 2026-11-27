@@ -61,6 +61,15 @@ impl DurableActor for Wallet {
 }
 
 #[tokio::test]
+async fn schema_migrations_are_idempotent_and_report_version() {
+    let storage = PostgresStorage::new(common::pool(&common::database_url()));
+    storage.migrate().await.unwrap();
+    assert_eq!(storage.schema_version().await.unwrap(), 1);
+    storage.migrate().await.unwrap();
+    assert_eq!(storage.schema_version().await.unwrap(), 1);
+}
+
+#[tokio::test]
 async fn fenced_handover_and_deduplication() {
     let url = common::database_url();
     let pool = common::pool(&url);

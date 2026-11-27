@@ -1,5 +1,22 @@
 # Actryn changelog
 
+## 1.0.0
+
+- The core runtime and bundled SQLite and PostgreSQL adapters are now production-capable in the documented supported configurations.
+- Added versioned infrastructure schema migration. SQLite records the version during `open()`; PostgreSQL adds `migrate()` and `schema_version()` with advisory-lock serialized migration.
+- Replaced string-only storage failures with structured `StorageError` values carrying provider, operation, provider code, and retryability.
+- Added `ActorRuntime::ownership_lost()` for process-local health observation when managed leases fail.
+- Added `ActorRuntimeBuilder::storage_shared()` so applications can inject any `Arc<dyn StorageAdapter>` chosen at runtime.
+- Documented the production scope and separated infrastructure migrations from application-owned state payload compatibility.
+- Enforced `missing_docs` for both public crates and completed rustdoc coverage for public APIs.
+- Removed string-to-`StorageError` conversions so every storage failure carries an explicit provider and operation.
+- Added MSRV and docs.rs metadata, organized version history, and added a local validation script.
+- Kept membership discovery, automatic failover, rebalance, authenticated multi-host transport, alerting, and SLA tooling outside Actryn core.
+
+## 0.6.0
+
+- Introduced the current actor scheduling model, shared durable commit behavior, and optional experimental RPC support.
+
 ## 0.1.0 — candidate
 
 - Added a provider-neutral storage API so applications can use compatible local or remote databases.
@@ -21,8 +38,4 @@
 - Extended the durable benchmark to vary actor count, state bytes, outbox-effect count and payload size, and PostgreSQL pool size.
 - Kept the optional TCP cluster transport experimental, loopback-only, and unauthenticated.
 
-This candidate is not production-ready. Actryn does not provide consensus, automatic failover, shard placement, rebalance, exactly-once external effects, or built-in durable state migrations.
-
-## 0.6.0
-
-- Introduced the current actor scheduling model, shared durable commit behavior, and optional experimental RPC support.
+This historical candidate line was superseded. It did not provide consensus, automatic failover, shard placement, rebalance, exactly-once external effects, or built-in durable state migrations.

@@ -1,4 +1,4 @@
-use actryn::ActorError;
+use actryn::{ActorError, StorageError};
 use futures::Future;
 use std::{
     collections::BTreeMap,
@@ -207,7 +207,7 @@ where
 fn error_kind(error: ActorError) -> String {
     match error {
         ActorError::Rejected(_) => "rejected".into(),
-        ActorError::Storage(message) => storage_error_kind(&message),
+        ActorError::Storage(detail) => storage_error_kind(&detail),
         ActorError::UnknownOutcome => "unknown_outcome".into(),
         ActorError::Codec(_) => "codec".into(),
         ActorError::RequestIdConflict => "request_id_conflict".into(),
@@ -228,17 +228,11 @@ fn error_kind(error: ActorError) -> String {
     }
 }
 
-fn storage_error_kind(message: &str) -> String {
-    let Some((_, detail)) = message.split_once("PostgreSQL SQLSTATE ") else {
-        return "storage_other".into();
-    };
-    detail
-        .split(|character: char| !character.is_ascii_alphanumeric())
-        .find(|candidate| candidate.len() == 5)
-        .map_or_else(
-            || "storage_sqlstate_other".into(),
-            |code| format!("storage_sqlstate_{code}"),
-        )
+fn storage_error_kind(detail: &StorageError) -> String {
+    match &detail.code {
+        Some(code) => format!("storage_{}_{}", detail.provider, code),
+        None => format!("storage_{}", detail.provider),
+    }
 }
 
 fn try_reserve(outstanding: &AtomicUsize, limit: usize) -> Option<usize> {

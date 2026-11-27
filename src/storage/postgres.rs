@@ -15,7 +15,7 @@ use deadpool_postgres::{Object, Pool};
 use tokio_postgres::{Transaction, error::SqlState};
 
 use crate::{
-    ActorError, TimingObserver, TimingStage,
+    ActorError, StorageError, TimingObserver, TimingStage,
     outbox::{OutboxRecord, OutboxStore},
     storage::{
         CommitRequest, CommitResult, LOGICAL_SHARDS, Ownership, ShardLocation, StorageAdapter,
@@ -23,6 +23,7 @@ use crate::{
     },
 };
 
+/// PostgreSQL-backed durable storage with transactional shard fencing.
 #[derive(Clone)]
 pub struct PostgresStorage {
     pool: Pool,
@@ -50,10 +51,12 @@ impl From<PostgresStorage> for super::StorageBackend {
 }
 
 fn db_error(error: impl std::fmt::Display) -> ActorError {
-    ActorError::Storage(error.to_string())
+    ActorError::Storage(StorageError::new("postgresql", "database", error))
 }
 
 const MAX_TRANSACTION_RETRIES: usize = 3;
+const SCHEMA_VERSION: u32 = 1;
+const MIGRATION_LOCK_ID: i64 = 0x0041_6374_7279_0001;
 
 #[derive(Debug)]
 enum CommitFailure {
@@ -80,7 +83,16 @@ impl CommitFailure {
         match self {
             Self::Actor(error) => error,
             Self::Database(error) => match error.code() {
-                Some(code) => ActorError::Storage(format!("PostgreSQL SQLSTATE {code:?}: {error}")),
+                Some(code) => {
+                    let mut detail = StorageError::new("postgresql", "transaction", &error)
+                        .with_code(code.code());
+                    if code == &SqlState::T_R_SERIALIZATION_FAILURE
+                        || code == &SqlState::T_R_DEADLOCK_DETECTED
+                    {
+                        detail = detail.retryable();
+                    }
+                    ActorError::Storage(detail)
+                }
                 None => db_error(error),
             },
             Self::UnknownOutcome => ActorError::UnknownOutcome,
@@ -105,7 +117,13 @@ fn as_i64(value: u64) -> Result<i64, ActorError> {
 }
 
 fn as_u64(value: i64) -> Result<u64, ActorError> {
-    u64::try_from(value).map_err(|_| ActorError::Storage("negative database version".into()))
+    u64::try_from(value).map_err(|_| {
+        ActorError::Storage(StorageError::new(
+            "postgresql",
+            "integer_conversion",
+            "negative database version",
+        ))
+    })
 }
 
 fn checked_lease(lease: Duration) -> Result<i64, ActorError> {
@@ -142,14 +160,80 @@ impl PostgresStorage {
         }
     }
 
-    /// Bootstrap for development. Production installations must use versioned
-    /// migrations; this function only creates the current schema if missing.
-    pub async fn initialize_schema(&self) -> Result<(), ActorError> {
-        self.client()
-            .await?
-            .batch_execute(include_str!("../../migrations/0001_init.sql"))
+    /// Applies bundled infrastructure schema migrations before durable use.
+    ///
+    /// This method is idempotent and serialized with a PostgreSQL transaction
+    /// advisory lock. It does not migrate application-owned actor state payloads.
+    pub async fn migrate(&self) -> Result<(), ActorError> {
+        let mut client = self.client().await?;
+        let tx = client.transaction().await.map_err(db_error)?;
+        tx.query_one(
+            "SELECT pg_advisory_xact_lock($1::bigint)",
+            &[&MIGRATION_LOCK_ID],
+        )
+        .await
+        .map_err(db_error)?;
+        tx.execute(
+            "CREATE TABLE IF NOT EXISTS actryn_schema_migrations (
+                version bigint PRIMARY KEY CHECK (version > 0),
+                applied_at timestamptz NOT NULL DEFAULT clock_timestamp()
+             )",
+            &[],
+        )
+        .await
+        .map_err(db_error)?;
+
+        let current: Option<i64> = tx
+            .query_opt("SELECT MAX(version) FROM actryn_schema_migrations", &[])
             .await
-            .map_err(db_error)
+            .map_err(db_error)?
+            .map(|row| row.get(0));
+        match current {
+            None => {
+                tx.batch_execute(include_str!("../../migrations/0001_init.sql"))
+                    .await
+                    .map_err(db_error)?;
+                tx.execute(
+                    "INSERT INTO actryn_schema_migrations(version) VALUES ($1)",
+                    &[&i64::from(SCHEMA_VERSION)],
+                )
+                .await
+                .map_err(db_error)?;
+            }
+            Some(version) if version == i64::from(SCHEMA_VERSION) => {}
+            Some(_) => return Err(ActorError::InvalidConfiguration),
+        }
+        tx.commit().await.map_err(db_error)
+    }
+
+    /// Returns the applied infrastructure schema version, or zero before migration.
+    pub async fn schema_version(&self) -> Result<u32, ActorError> {
+        let result = self
+            .client()
+            .await?
+            .query_opt(
+                "SELECT COALESCE(MAX(version), 0) FROM actryn_schema_migrations",
+                &[],
+            )
+            .await;
+        let row = match result {
+            Ok(row) => row,
+            Err(error) if error.code() == Some(&SqlState::UNDEFINED_TABLE) => return Ok(0),
+            Err(error) => return Err(db_error(error)),
+        };
+        let version: i64 = row.map(|row| row.get(0)).unwrap_or(0);
+        u32::try_from(version).map_err(|_| {
+            ActorError::Storage(StorageError::new(
+                "postgresql",
+                "schema_version",
+                "schema version exceeds supported range",
+            ))
+        })
+    }
+
+    /// Compatibility alias for [`Self::migrate`].
+    pub async fn initialize_schema(&self) -> Result<(), ActorError> {
+        self.migrate().await
     }
 
     async fn client(&self) -> Result<Object, ActorError> {
@@ -292,6 +376,7 @@ impl PostgresStorage {
         Ok(())
     }
 
+    /// Looks up the unexpired owner of one logical shard using database time.
     pub async fn locate(&self, shard: usize) -> Result<Option<ShardLocation>, ActorError> {
         if shard >= LOGICAL_SHARDS {
             return Err(ActorError::InvalidConfiguration);
@@ -420,9 +505,13 @@ impl PostgresStorage {
         let result = row
             .map(|r| {
                 let hash: Vec<u8> = r.get(0);
-                let hash = hash
-                    .try_into()
-                    .map_err(|_| ActorError::Storage("invalid receipt hash".into()))?;
+                let hash = hash.try_into().map_err(|_| {
+                    ActorError::Storage(StorageError::new(
+                        "postgresql",
+                        "receipt",
+                        "invalid receipt hash",
+                    ))
+                })?;
                 Ok((hash, r.get(1)))
             })
             .transpose()?;
@@ -550,6 +639,7 @@ impl PostgresStorage {
         }
     }
 
+    /// Reads at most `limit` undelivered outbox records in insertion order.
     pub async fn pending_outbox(&self, limit: usize) -> Result<Vec<OutboxRecord>, ActorError> {
         if !(1..=10_000).contains(&limit) {
             return Err(ActorError::InvalidConfiguration);
@@ -580,6 +670,7 @@ impl PostgresStorage {
             .collect())
     }
 
+    /// Persistently marks one outbox record as delivered.
     pub async fn ack_outbox(&self, id: i64) -> Result<(), ActorError> {
         self.client()
             .await?
@@ -667,5 +758,21 @@ impl StorageAdapter for PostgresStorage {
 
     async fn commit(&self, request: CommitRequest) -> Result<CommitResult, ActorError> {
         PostgresStorage::commit(self, request).await
+    }
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::*;
+
+    #[test]
+    fn postgres_errors_have_explicit_provider_and_operation() {
+        match as_u64(-1) {
+            Err(ActorError::Storage(detail)) => {
+                assert_eq!(detail.provider, "postgresql");
+                assert_eq!(detail.operation, "integer_conversion");
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
     }
 }

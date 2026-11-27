@@ -18,6 +18,7 @@ pub use backend::StorageBackend;
 pub use postgres::PostgresStorage;
 pub use sqlite::SqliteStorage;
 
+/// Number of stable logical shards used for placement and fencing.
 pub const LOGICAL_SHARDS: usize = 256;
 
 /// Assign each logical shard to one node in a fixed membership list.
@@ -104,12 +105,18 @@ fn rendezvous_score(shard: usize, node_id: &str) -> u64 {
     ])
 }
 
+/// Active owner metadata for one logical shard.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShardLocation {
+    /// Logical shard index.
     pub shard: usize,
+    /// Owner identity stored in the lease table.
     pub owner_id: String,
+    /// Endpoint advertised by the owner.
     pub endpoint: String,
+    /// Fencing epoch for the current owner.
     pub epoch: u64,
+    /// Lease expiry in Unix milliseconds using the provider's clock.
     pub expires_at_ms: i64,
 }
 
@@ -128,6 +135,7 @@ pub fn shard_for(kind: &str, key: &str) -> usize {
     (stable_actor_hash(kind, key) % LOGICAL_SHARDS as u64) as usize
 }
 
+/// Fencing token snapshot for a set of logical shards.
 #[derive(Clone)]
 pub struct Ownership {
     owner: Arc<str>,
@@ -166,21 +174,34 @@ impl Ownership {
 /// Complete durable state transition. The backend commits all fields atomically.
 /// Ownership validation and state-version comparison are part of that transaction.
 pub struct CommitRequest {
+    /// Ownership snapshot to validate inside the commit transaction.
     pub ownership: Ownership,
+    /// Registered actor kind.
     pub kind: &'static str,
+    /// Logical actor key.
     pub key: String,
+    /// Caller-supplied idempotency key.
     pub request_id: String,
+    /// Hash of the serialized command payload.
     pub request_hash: [u8; 32],
+    /// Actor state version expected by the caller.
     pub expected_version: u64,
+    /// Serialized candidate state.
     pub state: Vec<u8>,
+    /// Serialized reply to persist for duplicate retries.
     pub reply: Vec<u8>,
+    /// Durable outbox effects to commit with the state.
     pub effects: Vec<OutboxEffect>,
 }
 
 #[derive(Debug)]
+/// Outcome of one storage commit attempt.
 pub enum CommitResult {
+    /// State, receipt, and effects were committed.
     Applied,
+    /// The request had already committed; contains the original reply.
     Duplicate(Vec<u8>),
+    /// The expected state version was stale; nothing was written.
     VersionConflict,
 }
 

@@ -1,4 +1,9 @@
 //! Runtime construction and typed actor references.
+//!
+//! Internal `expect` calls after construction rely on validation in
+//! `ActorRuntimeBuilder::validate`; request identifiers and keys are checked
+//! before they reach the scheduler. User-controlled failures are returned as
+//! [`crate::ActorError`].
 use super::actor::{DurableActor, DurableKind, ErasedKind, Mode, SessionActor, SessionKind};
 use super::metrics::{RuntimeMetrics, ShardMetrics};
 use super::scheduler::{ActorId, CommandRequest, Envelope, Ingress, Request, Shard};
@@ -37,6 +42,7 @@ impl Drop for TimingGuard<'_> {
     }
 }
 
+/// Configures and builds an [`ActorRuntime`].
 pub struct ActorRuntimeBuilder {
     kinds: HashMap<&'static str, Arc<dyn ErasedKind>>,
     storage: Option<StorageBackend>,
@@ -159,9 +165,23 @@ impl ActorRuntimeBuilder {
         });
         self
     }
-    /// Install a durable storage backend. Both backends share the same runtime.
+    /// Install a durable storage adapter.
+    ///
+    /// Any type implementing [`crate::storage::StorageAdapter`] can be used,
+    /// including a [`crate::storage::StorageBackend`] or an application-defined
+    /// provider. The runtime depends only on that contract.
     pub fn storage<A: crate::storage::StorageAdapter>(mut self, storage: A) -> Self {
         self.storage = Some(StorageBackend::new(storage));
+        self
+    }
+
+    /// Install a durable storage adapter through a shared trait object.
+    ///
+    /// This supports adapters chosen or constructed at runtime without adding
+    /// provider-specific branches to the runtime. The adapter must still satisfy
+    /// the full storage and outbox contract.
+    pub fn storage_shared(mut self, storage: Arc<dyn crate::storage::StorageAdapter>) -> Self {
+        self.storage = Some(StorageBackend::from_shared(storage));
         self
     }
     /// Human-readable owner identity; each Runtime build gets a fresh ownership epoch.
@@ -169,18 +189,22 @@ impl ActorRuntimeBuilder {
         self.node_id = id.into();
         self
     }
+    /// Sets the number of physical scheduler tasks. Must be non-zero.
     pub fn shards(mut self, shards: usize) -> Self {
         self.shards = shards;
         self
     }
+    /// Sets each shard's bounded ingress channel capacity. Must be non-zero.
     pub fn ingress_capacity(mut self, cap: usize) -> Self {
         self.ingress_capacity = cap;
         self
     }
+    /// Sets each actor activation's bounded mailbox capacity. Must be non-zero.
     pub fn mailbox_capacity(mut self, cap: usize) -> Self {
         self.mailbox_capacity = cap;
         self
     }
+    /// Sets the maximum resident activations per shard. Must be non-zero.
     pub fn activation_limit(mut self, limit: usize) -> Self {
         self.activation_limit = limit;
         self
@@ -194,15 +218,18 @@ impl ActorRuntimeBuilder {
         self.timing_observer = Some(observer);
         self
     }
+    /// Sets the idle duration before an activation may be evicted. Must be non-zero.
     pub fn idle_timeout(mut self, duration: Duration) -> Self {
         self.idle_timeout = duration;
         self
     }
+    /// Sets how often shards scan for idle activations. Must be non-zero.
     pub fn eviction_interval(mut self, duration: Duration) -> Self {
         self.eviction_interval = duration;
         self
     }
 
+    /// Registers a durable actor kind. Each kind may be registered only once.
     pub fn register_durable<A: DurableActor>(mut self) -> Result<Self, ActorError> {
         if A::KIND.is_empty() {
             return Err(ActorError::InvalidKey);
@@ -216,6 +243,7 @@ impl ActorRuntimeBuilder {
         }
         Ok(self)
     }
+    /// Registers a session actor kind. Each kind may be registered only once.
     pub fn register_session<A: SessionActor>(mut self) -> Result<Self, ActorError> {
         if A::KIND.is_empty() {
             return Err(ActorError::InvalidKey);
@@ -518,6 +546,7 @@ pub struct ActorRuntime {
 }
 
 impl ActorRuntime {
+    /// Creates a new builder with default capacities and timing.
     pub fn builder() -> ActorRuntimeBuilder {
         ActorRuntimeBuilder::new()
     }
@@ -541,6 +570,7 @@ impl ActorRuntime {
     pub(crate) fn lease_managed(&self) -> bool {
         self.inner.lease_managed
     }
+    /// Returns a typed reference to a durable actor with the supplied key.
     pub fn durable<A: DurableActor>(&self, key: impl Into<String>) -> DurableRef<A> {
         DurableRef {
             key: key.into(),
@@ -548,6 +578,7 @@ impl ActorRuntime {
             _kind: PhantomData,
         }
     }
+    /// Returns a typed reference to a session actor with the supplied key.
     pub fn session<A: SessionActor>(&self, key: impl Into<String>) -> SessionRef<A> {
         SessionRef {
             key: key.into(),
@@ -595,6 +626,14 @@ impl ActorRuntime {
         total
     }
 
+    /// Reports whether a managed lease has been lost.
+    ///
+    /// Once true, new durable calls fail with [`ActorError::OwnershipLost`].
+    /// This is a process-local health observation and is not a fencing authority.
+    pub fn ownership_lost(&self) -> bool {
+        self.inner.ownership_lost.load(Ordering::Acquire)
+    }
+
     /// Stop accepting new commands and drain accepted turns. Concurrent callers
     /// observe the *same completion*: neither may return early. If a caller's
     /// future is cancelled, a separately owned shutdown task keeps draining.
@@ -629,6 +668,7 @@ fn shard_index(id: &ActorId, count: usize) -> usize {
     (crate::storage::stable_actor_hash(id.kind, &id.key) % count as u64) as usize
 }
 
+/// Typed reference to one durable actor identity.
 pub struct DurableRef<A: DurableActor> {
     key: String,
     runtime: ActorRuntime,
@@ -644,6 +684,9 @@ impl<A: DurableActor> Clone for DurableRef<A> {
     }
 }
 impl<A: DurableActor> DurableRef<A> {
+    /// Submits one idempotent durable command and waits for its committed reply.
+    ///
+    /// Retry ambiguous failures with the same request ID and command payload.
     pub async fn command(
         &self,
         request_id: impl Into<String>,
@@ -678,6 +721,7 @@ impl<A: DurableActor> DurableRef<A> {
             .downcast::<A::Reply>()
             .map_err(|_| ActorError::TypeMismatch)?)
     }
+    /// Reads a fenced clone of the actor's current cached state.
     pub async fn read(&self) -> Result<A::State, ActorError> {
         let id = ActorId {
             kind: A::KIND,
@@ -698,6 +742,7 @@ impl<A: DurableActor> DurableRef<A> {
     }
 }
 
+/// Typed reference to one session actor identity.
 pub struct SessionRef<A: SessionActor> {
     key: String,
     runtime: ActorRuntime,
@@ -713,6 +758,7 @@ impl<A: SessionActor> Clone for SessionRef<A> {
     }
 }
 impl<A: SessionActor> SessionRef<A> {
+    /// Submits one volatile command and waits for its reply.
     pub async fn command(&self, cmd: A::Command) -> Result<A::Reply, ActorError> {
         let _timer = self.runtime.stage_timer(TimingStage::ClientResponse);
         let id = ActorId {
@@ -738,6 +784,7 @@ impl<A: SessionActor> SessionRef<A> {
             .downcast::<A::Reply>()
             .map_err(|_| ActorError::TypeMismatch)?)
     }
+    /// Reads a clone of the actor's current in-memory state.
     pub async fn read(&self) -> Result<A::State, ActorError> {
         let id = ActorId {
             kind: A::KIND,

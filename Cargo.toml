@@ -4,14 +4,18 @@ resolver = "3"
 
 [package]
 name = "actryn"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
+rust-version = "1.99"
 license = "AGPL-3.0-only"
 description = "Actryn: experimental Rust virtual actor runtime with durable and session actors"
 repository = "https://github.com/balovess/Actryn"
 readme = "README.md"
 keywords = ["actor", "virtual-actor", "runtime", "async", "storage"]
 categories = ["asynchronous", "concurrency"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
@@ -37,3 +41,7 @@ optional = true
 [dependencies.tokio-postgres]
 version = "0.7"
 optional = true
+
+[[example]]
+name = "postgres_migrations"
+required-features = ["postgres"]

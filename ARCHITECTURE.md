@@ -45,6 +45,12 @@ When an application explicitly assigns shards to a runtime, the runtime renews t
 
 For a fixed cluster membership, applications can choose between `balanced_initial_shards` / `claim_balanced_shards`, which distribute shards exactly evenly, and `rendezvous_initial_shards` / `claim_rendezvous_shards`, which reduce shard movement when membership changes at the cost of approximate balance. Every node must use the same member IDs. These planners do not discover members or transfer state; changing the member list requires an application-owned migration.
 
+## Schema lifecycle
+
+Bundled adapters record an infrastructure schema version in the database. SQLite applies and records migrations in `open()`; PostgreSQL exposes `migrate()` and `schema_version()`, with advisory-lock serialization for concurrent deployment attempts. Migration of application-owned actor state payloads is deliberately outside this mechanism.
+
+Storage failures surface as structured `StorageError` values with provider, operation, provider code, and retryability. Ambiguous commit outcomes remain a separate `ActorError::UnknownOutcome` so callers cannot mistake them for known failures.
+
 The experimental cluster client caches shard routes for up to five seconds. For remote calls, a routing or transport failure invalidates the observed route, looks up placement again, and retries once. If a locally handled call reports an ownership failure, the client drops that route and returns the error; the next call resolves placement again. The cache is only a routing hint: storage fencing remains the authority for reads and commits, and Actryn does not perform automatic failover.
 
 A remote timeout after the request may have reached the server is reported as `ActorError::UnknownOutcome`. Callers retry with the same request ID and payload; a timeout before a connection is established remains a protocol error.
@@ -53,8 +59,10 @@ A remote timeout after the request may have reached the server is reported as `A
 
 Runtime metrics are process-local observations and are not transactionally consistent across shards. Accepted-request counts describe mailbox admission, not successful execution. Rejected-request counts describe scheduler ingress rejection, not handler or storage failures. Metrics must not be used to make ownership or durability decisions.
 
+`ActorRuntime::ownership_lost()` exposes the runtime's fail-closed lease state for process-local health checks. It is an observation, not a fencing authority; storage ownership checks remain authoritative.
+
 ## Distribution limits
 
 The optional RPC transport is experimental, loopback-only, and unauthenticated. Actryn does not provide a membership service, consensus, automatic failover, or rebalance controller. PostgreSQL fencing protects storage operations from stale owners; it does not make the RPC transport safe for untrusted networks.
 
-Durable state has no built-in schema migration mechanism. Applications are responsible for keeping persisted state compatible with the versions that read it.
+Application-owned durable state payloads have no built-in migration mechanism. Applications are responsible for keeping persisted state compatible with the versions that read it.
