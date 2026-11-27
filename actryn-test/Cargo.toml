@@ -1,6 +1,6 @@
 [package]
 name = "actryn-test"
-version = "1.0.0"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.99"
 license = "AGPL-3.0-only"
@@ -16,7 +16,7 @@ postgres = ["actryn/postgres", "dep:deadpool-postgres", "dep:tokio-postgres"]
 experimental-rpc = ["actryn/experimental-rpc"]
 
 [dependencies]
-actryn = { path = "..", version = "1.0.0" }
+actryn = { path = "..", version = "0.1.0" }
 async-trait = "0.1"
 deadpool-postgres = { version = "0.14", optional = true }
 tokio-postgres = { version = "0.7", optional = true }

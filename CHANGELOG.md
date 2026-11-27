@@ -1,8 +1,8 @@
 # Actryn changelog
 
-## 1.0.0
+## 0.1.0
 
-- The core runtime and bundled SQLite and PostgreSQL adapters are now production-capable in the documented supported configurations.
+- Published the early-stage `0.1.0` library API and documented the supported actor and storage contracts.
 - Added versioned infrastructure schema migration. SQLite records the version during `open()`; PostgreSQL adds `migrate()` and `schema_version()` with advisory-lock serialized migration.
 - Replaced string-only storage failures with structured `StorageError` values carrying provider, operation, provider code, and retryability.
 - Added `ActorRuntime::ownership_lost()` for process-local health observation when managed leases fail.
@@ -17,7 +17,7 @@
 
 - Introduced the current actor scheduling model, shared durable commit behavior, and optional experimental RPC support.
 
-## 0.1.0 — candidate
+## Pre-0.1.0 candidate (superseded)
 
 - Added a provider-neutral storage API so applications can use compatible local or remote databases.
 - Added optional PostgreSQL storage with shared persistence and shard ownership fencing; SQLite remains intended for single-host use.

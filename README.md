@@ -2,9 +2,21 @@
 
 [![License: AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-blue.svg)](LICENSE)
 
-**Actryn** is a Rust virtual-actor runtime for applications that need stable actor identities, bounded scheduling, and explicit persistence behavior. The Cargo package and Rust crate are both named `actryn`.
+**Actryn** is a Rust library for applications that need stable virtual-actor identities, bounded scheduling, and explicit persistence behavior. Add the `actryn` crate to an application and construct the runtime inside that application; Actryn does not run as a separate service.
 
-> **Status:** v1.0.0. The core runtime and bundled SQLite and PostgreSQL adapters are production-capable in the supported configurations below. The optional cluster transport remains experimental.
+> **Status:** v0.1.0. The public library and storage contracts are early-stage and may evolve. Durable guarantees and provider requirements are described below and in [CONTRACTS.md](CONTRACTS.md). The optional cluster transport is experimental.
+
+## Add Actryn to an application
+
+SQLite is available by default. Enable the `postgres` feature to use the bundled PostgreSQL adapter:
+
+```toml
+[dependencies]
+actryn = "0.1"
+# actryn = { version = "0.1", features = ["postgres"] }
+```
+
+Start with the runnable [mixed actor example](examples/mixed.rs) or [custom adapter example](examples/custom_adapter.rs). The custom adapter example wraps SQLite to demonstrate the adapter seam; a database implementation of your own must independently satisfy the full [storage contract](CONTRACTS.md#storage-provider-requirements).
 
 ## How it works
 
@@ -41,17 +53,11 @@ Durable commands use request IDs for deduplication. If a storage or transport fa
 - Synchronous `handle()` and `decide()` callbacks are not preempted; a long-running callback delays other actors on the same scheduler.
 - Infrastructure schemas are versioned and migrated by the bundled adapters. Application-owned actor state payload compatibility remains the application's responsibility.
 
-## Production scope
+## Library guarantees and limits
 
-Actryn core is supported for these configurations:
+Durable actors use a storage adapter to commit state, request receipts, and outbox effects atomically. SQLite is intended for one host; PostgreSQL adds shared persistence and fencing when runtimes claim shards explicitly. A custom adapter can be injected with `storage()` or `storage_shared()`, but must satisfy the complete provider contract before it is used for durable actors. Run the adapter checks from [`actryn-test`](actryn-test/) against a dedicated test database when validating an implementation.
 
-- Single-host SQLite with `standalone()` and a dedicated database file.
-- PostgreSQL with explicit shard claims, database-clock leases, and fencing. Each node must use a unique, stable `node_id`.
-- Custom `StorageAdapter` implementations that independently satisfy the [storage contract](CONTRACTS.md#storage-provider-requirements).
-
-Before enabling durable work, call the adapter's migration entry point (`SqliteStorage::open()` migrates automatically; PostgreSQL deployments call `PostgresStorage::migrate()`). Use `shutdown()` for deterministic drain and lease release, and make outbox consumers idempotent on `delivery_id`.
-
-Actryn core does not provide membership discovery, automatic failover, rebalance, authenticated multi-host transport, exactly-once external effects, application state payload migration, deployment orchestration, alerting, or SLA tooling. Those responsibilities belong to the application or a separate operations layer.
+Session actor state is in memory and may be lost on passivation or process restart. Actryn does not provide membership discovery, consensus, automatic failover, state migration, exactly-once external effects, or deployment and operations tooling. The optional RPC transport is loopback-only, unauthenticated, and experimental.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the runtime model and [CONTRACTS.md](CONTRACTS.md) for the guarantees and responsibilities applications and storage providers rely on.
 
@@ -76,7 +82,7 @@ The PostgreSQL migration example expects `ACTOR_BENCH_DATABASE_URL` to point at 
 
 ## Compatibility
 
-`actryn` and `actryn-test` target Rust 1.99 and follow semantic versioning for their documented public APIs. Within 1.x, breaking public API changes require a minor version; additive and corrective changes use patch versions. The `experimental-rpc` feature is explicitly unstable and may change in a minor release. Logical shard placement and infrastructure schema versions are versioned and must not change without an application-owned migration.
+`actryn` and `actryn-test` target Rust 1.99. Version `0.1.x` is pre-1.0: public interfaces may change in a minor release, while patch releases should remain compatible. The `experimental-rpc` feature is explicitly unstable. Logical shard placement and infrastructure schema versions must not change without an application-owned migration.
 
 ## Storage providers
 

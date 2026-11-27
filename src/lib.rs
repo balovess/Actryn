@@ -1,11 +1,13 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
-//! Actryn is an embedded, multi-type virtual actor runtime.
+//! Actryn is a Rust library for embedding a multi-type virtual actor runtime in an application.
 //!
 //! One bounded scheduler per shard serves *both* durable and session actors.
 //! Durable commands are serialized, deduplicated and committed before success.
 //! Session commands mutate volatile memory, with no persistence guarantee.
+//! See the crate README for runnable examples and `CONTRACTS.md` for the storage
+//! adapter requirements and the guarantees callers can rely on.
 //!
 //! SQLite is single-host only. PostgreSQL provides transactional cross-host
 //! ownership fencing, but remote RPC still requires a trusted loopback boundary.
