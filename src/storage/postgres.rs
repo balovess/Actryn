@@ -184,10 +184,10 @@ impl PostgresStorage {
         .map_err(db_error)?;
 
         let current: Option<i64> = tx
-            .query_opt("SELECT MAX(version) FROM actryn_schema_migrations", &[])
+            .query_one("SELECT MAX(version) FROM actryn_schema_migrations", &[])
             .await
             .map_err(db_error)?
-            .map(|row| row.get(0));
+            .get(0);
         match current {
             None => {
                 tx.batch_execute(include_str!("../../migrations/0001_init.sql"))
